@@ -489,10 +489,43 @@ class DailyImprovementLoopTests(unittest.TestCase):
                             "content": '<scheduled-task name="weekly" file="/tmp/SK">do not run twice instead',
                         },
                     },
+                    {
+                        "type": "user",
+                        "sessionId": "s4",
+                        "timestamp": "2026-06-15T00:00:14Z",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "see this. i had to improvise. [00:01:16] <b>Speaker 1:</b> "
+                                "Actually, do not worry. [00:01:24] <b>Speaker 2:</b> instead "
+                                "let's never do that."
+                            ),
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "s4",
+                        "timestamp": "2026-06-15T00:00:15Z",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "[00:00:34] Speaker 1: Actually I know. [00:00:39] Speaker 2: "
+                                "instead do not stop doing this."
+                            ),
+                        },
+                    },
                 ],
             )
             summary = loop.parse_claude_session(path)
             self.assertEqual(summary.corrections, [])
+
+    def test_single_timestamp_correction_is_still_detected(self):
+        # One stray timestamp must NOT suppress a genuine correction.
+        self.assertTrue(
+            loop.is_user_correction_text(
+                "Actually that's wrong, at [00:15] the copy still has AI-isms. Do not ship it."
+            )
+        )
 
     def test_proposals_are_routed(self):
         with tempfile.TemporaryDirectory() as td:
