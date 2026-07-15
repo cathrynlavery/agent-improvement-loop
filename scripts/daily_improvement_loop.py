@@ -56,6 +56,12 @@ CORRECTION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+# Pasted call/meeting transcripts (speaker-tagged or timestamped dialogue) are
+# source material the user is relaying, not a correction of the agent. The
+# transcript body routinely contains weak trigger words ("actually", "instead")
+# that would otherwise match CORRECTION_RE.
+TRANSCRIPT_SPEAKER_RE = re.compile(r"<b>\s*speaker\s*\d+", re.IGNORECASE)
+TRANSCRIPT_TIMESTAMP_RE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\]")
 FAILURE_RE = re.compile(
     r"("
     r"exit code:\s*[1-9]|non-zero|command not found|no such file|"
@@ -507,8 +513,26 @@ def is_transcript_scaffold(text: str, path: Optional[Path] = None) -> bool:
     )
 
 
+def looks_like_pasted_transcript(text: str) -> bool:
+    """True when text is a pasted call/meeting transcript, not a user correction.
+
+    Detected by speaker-tagged dialogue (`<b>Speaker 1:`) or two or more
+    timestamp markers (`[00:01:16]`). One stray timestamp is not enough.
+    """
+    if not text:
+        return False
+    if TRANSCRIPT_SPEAKER_RE.search(text):
+        return True
+    return len(TRANSCRIPT_TIMESTAMP_RE.findall(text)) >= 2
+
+
 def is_user_correction_text(text: str, path: Optional[Path] = None) -> bool:
-    return bool(text and not is_transcript_scaffold(text, path) and CORRECTION_RE.search(text))
+    return bool(
+        text
+        and not is_transcript_scaffold(text, path)
+        and not looks_like_pasted_transcript(text)
+        and CORRECTION_RE.search(text)
+    )
 
 
 def add_pp_cli_evidence(summary: SessionSummary, cli: str, ev: Evidence) -> None:
