@@ -7,3 +7,6 @@ venv/
 .agent-improvement/
 private/
 *.local.json
+build/
+dist/
+*.egg-info/

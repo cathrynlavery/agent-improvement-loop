@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd job: run the scan Monday and Thursday at 07:00.
+  Install:
+    1. Replace YOUR_USERNAME and the repo path below.
+    2. cp examples/com.example.agent-improvement-loop.plist \
+         ~/Library/LaunchAgents/com.example.agent-improvement-loop.plist
+    3. launchctl load ~/Library/LaunchAgents/com.example.agent-improvement-loop.plist
+  The scan is automated; applying proposals stays manual.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.agent-improvement-loop</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/agent-improvement-loop/bin/daily-improvement-loop</string>
+        <string>--since-days</string>
+        <string>4</string>
+        <string>--max-sessions</string>
+        <string>1000</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/agent-improvement-loop</string>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.agent-improvement/logs/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.agent-improvement/logs/launchd.err.log</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key>
+            <integer>1</integer>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>4</integer>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+</dict>
+</plist>
