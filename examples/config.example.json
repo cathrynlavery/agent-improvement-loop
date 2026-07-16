@@ -7,5 +7,6 @@
   "extra_redaction_patterns": [["\\bacme-[0-9]{6}\\b", "<redacted-acme-id>"]],
   "extra_backlog_ignore": ["mycorp-wrapper"],
   "extra_remote_command_wrappers": ["myssh"],
-  "include_subagent_failures": false
+  "include_subagent_failures": false,
+  "validate_pp_cli_candidates": true
 }

@@ -182,6 +182,9 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                 {
                                     "type": "tool_result",
                                     "tool_use_id": "call4",
+                                    # The bulk command failed explicitly; its
+                                    # text is used only to localize which CLI.
+                                    "is_error": True,
                                     "content": (
                                         "stripe-pp-cli\n"
                                         "OK Auth: configured\n"
@@ -242,6 +245,92 @@ class DailyImprovementLoopTests(unittest.TestCase):
             proposals = loop.generate_proposals([summary])
             self.assertFalse([p for p in proposals if p["route"] == "tool"])
 
+    def test_text_only_pp_cli_failure_language_is_not_hard_failure(self):
+        # Redacted from the rejected meta-ads/doctor probes in the 20260716
+        # triage batch: diagnostic output is not a failed tool result.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "assistant",
+                        "sessionId": "statusless",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "probe",
+                                    "name": "Bash",
+                                    "input": {"command": "meta-ads-pp-cli me --agent"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "statusless",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "probe",
+                                    "content": "Error: auth not configured; intentional probe",
+                                }
+                            ],
+                        },
+                    },
+                ],
+            )
+
+            summary = loop.parse_claude_session(path)
+
+            self.assertEqual(summary.failures, [])
+            self.assertFalse([p for p in loop.generate_proposals([summary]) if p["route"] == "tool"])
+
+    def test_completed_codex_inspection_output_is_not_hang_or_failure(self):
+        # Redacted composite of fast help/doctor/truncation false positives
+        # from the rejected Klaviyo and RonanRx proposals.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "codex.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "name": "exec",
+                            "call_id": "inspect",
+                            "input": (
+                                'const r = await tool("exec", {cmd: '
+                                '"klaviyo-pp-cli doctor --json"}); return r;'
+                            ),
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "inspect",
+                            "output": (
+                                "Script completed\nWall time 0.1 seconds\n"
+                                "Warning: truncated output; auth not configured; "
+                                "API reachable (HTTP 404 at /); timeout flag available"
+                            ),
+                        },
+                    },
+                ],
+            )
+
+            summary = loop.parse_codex_session(path)
+            kinds = {ev.kind for ev in summary.pp_cli_invocations["klaviyo-pp-cli"]}
+
+            self.assertEqual(summary.failures, [])
+            self.assertEqual(kinds, {"pp_cli_invocation"})
+
     def test_pp_cli_mentions_inside_command_arguments_are_not_invocations(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
@@ -273,6 +362,18 @@ class DailyImprovementLoopTests(unittest.TestCase):
             )
             summary = loop.parse_claude_session(path)
             self.assertEqual(summary.pp_cli_invocations, {})
+
+    def test_pp_cli_inside_heredoc_prompt_is_not_invocation(self):
+        # Redacted from the Meta Ads false positive: the CLI appeared only in
+        # a handoff prompt whose surrounding shell later had a parse error.
+        command = (
+            "cat > /tmp/task.txt <<'EOF'\n"
+            "Run meta-ads-pp-cli me --agent and report the result.\n"
+            "EOF\n"
+            "printf 'prompt ready\\n'"
+        )
+
+        self.assertEqual(loop.pp_cli_names(command), [])
 
     def test_pp_cli_inside_remote_shell_command_counts(self):
         with tempfile.TemporaryDirectory() as td:
@@ -711,11 +812,12 @@ class DailyImprovementLoopTests(unittest.TestCase):
             self.assertEqual(len(tool_props), 1)
             self.assertIn("hang/timeout", tool_props[0]["summary"])
 
-    def test_pp_cli_retried_in_one_session_is_flagged_without_failure(self):
+    def test_pp_cli_syntax_guessing_is_flagged_without_failure(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             rows = []
-            for i in range(3):
+            flags = ["--name", "--profile-name", "--label"]
+            for i, flag in enumerate(flags):
                 rows.append(
                     {
                         "type": "assistant",
@@ -728,7 +830,9 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "type": "tool_use",
                                     "id": f"r{i}",
                                     "name": "Bash",
-                                    "input": {"command": f"wavespeed-pp-cli profile save --name a{i}"},
+                                    "input": {
+                                        "command": f"wavespeed-pp-cli profile save {flag} a{i}"
+                                    },
                                 }
                             ],
                         },
@@ -741,6 +845,56 @@ class DailyImprovementLoopTests(unittest.TestCase):
             tool_props = [p for p in proposals if p["target"]["name"] == "wavespeed-pp-cli"]
             self.assertEqual(len(tool_props), 1)
             self.assertIn("retried up to 3x", tool_props[0]["summary"])
+
+    def test_repeated_normal_cli_use_is_not_retry_friction(self):
+        summary = loop.SessionSummary(source="claude", path=Path("normal.jsonl"), session_id="r2")
+        summary.pp_cli_invocations["ronanrx-pp-cli"] = [
+            loop.Evidence(
+                source="claude",
+                path="normal.jsonl",
+                line=i,
+                kind="pp_cli_invocation",
+                excerpt=f"ronanrx-pp-cli patient find patient-{i}",
+                session_id="r2",
+                command=f"ronanrx-pp-cli patient find patient-{i}",
+            )
+            for i in range(27)
+        ]
+
+        proposals = loop.generate_proposals([summary])
+
+        self.assertFalse([p for p in proposals if p["target"]["name"] == "ronanrx-pp-cli"])
+
+    def test_repeated_cli_use_with_same_session_hang_is_retry_friction(self):
+        summary = loop.SessionSummary(source="claude", path=Path("hang.jsonl"), session_id="r3")
+        invocations = [
+            loop.Evidence(
+                source="claude",
+                path="hang.jsonl",
+                line=i,
+                kind="pp_cli_invocation",
+                excerpt="granola-pp-cli folders list --agent",
+                session_id="r3",
+                command="granola-pp-cli folders list --agent",
+            )
+            for i in range(3)
+        ]
+        hang = loop.Evidence(
+            source="claude",
+            path="hang.jsonl",
+            line=4,
+            kind="pp_cli_hang",
+            excerpt="still running",
+            session_id="r3",
+            command="granola-pp-cli folders list --agent",
+        )
+        summary.pp_cli_invocations["granola-pp-cli"] = invocations + [hang]
+
+        proposals = loop.generate_proposals([summary])
+        proposal = next(p for p in proposals if p["target"]["name"] == "granola-pp-cli")
+
+        self.assertIn("hang/timeout", proposal["summary"])
+        self.assertIn("retried up to 3x", proposal["summary"])
 
     def test_printing_press_source_line_added_to_tool_proposal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -776,6 +930,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                 {
                                     "type": "tool_result",
                                     "tool_use_id": "callp",
+                                    "is_error": True,
                                     "content": "Error: unknown option --name",
                                 }
                             ],
@@ -808,6 +963,40 @@ class DailyImprovementLoopTests(unittest.TestCase):
             ]
         proposals = loop.generate_proposals([summary])
         self.assertEqual([p for p in proposals if p["route"] == "tool"], [])
+
+    def test_unresolved_code_literal_only_cli_candidate_is_dropped(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            summary = loop.SessionSummary(source="codex", path=Path("x"), session_id="code1")
+            command = 'const r = tool({cmd: "fabricated-pp-cli --version"});'
+            summary.tool_calls.append(
+                loop.ToolCall(call_id="x", name="exec", line=1, command=command)
+            )
+            summary.pp_cli_invocations["fabricated-pp-cli"] = [
+                loop.Evidence(
+                    source="codex",
+                    path="x",
+                    line=2,
+                    kind="pp_cli_hang",
+                    excerpt="timed out",
+                    session_id="code1",
+                    command=command,
+                )
+            ]
+
+            original = loop.VALIDATE_PP_CLI_CANDIDATES
+            try:
+                proposals = loop.generate_proposals([summary], root)
+                self.assertEqual([p for p in proposals if p["route"] == "tool"], [])
+
+                loop.VALIDATE_PP_CLI_CANDIDATES = False
+                proposals = loop.generate_proposals([summary], root)
+                self.assertEqual(
+                    [p["target"]["name"] for p in proposals if p["route"] == "tool"],
+                    ["fabricated-pp-cli"],
+                )
+            finally:
+                loop.VALIDATE_PP_CLI_CANDIDATES = original
 
     def test_repeated_slash_command_stages_content_idea(self):
         sessions = []
@@ -1150,6 +1339,24 @@ class CurrentTranscriptFormatTests(unittest.TestCase):
             kinds = {ev.kind for ev in summary.pp_cli_invocations["stripe-pp-cli"]}
             self.assertIn("tool_failure", kinds)
 
+    def test_code_literal_escaped_newline_does_not_fabricate_cli_name(self):
+        # Redacted from the exact `|| true\ncloudflare-pp-cli` shape that
+        # produced the rejected truencloudflare-pp-cli proposal.
+        code = (
+            'const r = await tool("exec", {"cmd": '
+            '"rg missing || true\\ncloudflare-pp-cli --version"}); return r;'
+        )
+
+        self.assertEqual(loop.pp_cli_names_from_code(code), ["cloudflare-pp-cli"])
+
+    def test_code_literal_patch_text_is_not_cli_invocation(self):
+        code = (
+            'const patch = "*** Begin Patch\\n'
+            '+Run ronanrx-pp-cli doctor --agent\\n*** End Patch";'
+        )
+
+        self.assertEqual(loop.pp_cli_names_from_code(code), [])
+
     def test_codex_custom_tool_call_prose_literal_is_not_invocation(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "codex.jsonl"
@@ -1446,6 +1653,7 @@ class ConfigAndHealthTests(unittest.TestCase):
             set(loop.BACKLOG_IGNORE_EXECUTABLES),
             set(loop.REMOTE_COMMAND_WRAPPERS),
             loop.INCLUDE_SUBAGENT_FAILURES,
+            loop.VALIDATE_PP_CLI_CANDIDATES,
         )
 
     def _restore_globals(self, snap):
@@ -1458,6 +1666,7 @@ class ConfigAndHealthTests(unittest.TestCase):
             ignore,
             wrappers,
             loop.INCLUDE_SUBAGENT_FAILURES,
+            loop.VALIDATE_PP_CLI_CANDIDATES,
         ) = snap
         loop.EXTRA_SCAFFOLD_MARKERS[:] = markers
         loop.SECRET_PATTERNS[:] = patterns
@@ -1476,6 +1685,7 @@ class ConfigAndHealthTests(unittest.TestCase):
                     "extra_redaction_patterns": [[r"\bacme-[0-9]{6}\b", "<redacted-acme>"]],
                     "extra_backlog_ignore": ["mytool"],
                     "include_subagent_failures": True,
+                    "validate_pp_cli_candidates": False,
                 }
             )
             self.assertEqual(loop.pp_cli_names("stripe-acme-cli ls"), ["stripe-acme-cli"])
@@ -1486,6 +1696,7 @@ class ConfigAndHealthTests(unittest.TestCase):
             self.assertNotIn("acme-123456", loop.redact("id acme-123456 leaked"))
             self.assertIn("mytool", loop.BACKLOG_IGNORE_EXECUTABLES)
             self.assertTrue(loop.INCLUDE_SUBAGENT_FAILURES)
+            self.assertFalse(loop.VALIDATE_PP_CLI_CANDIDATES)
         finally:
             self._restore_globals(snap)
 
@@ -1563,6 +1774,49 @@ class McpFailureTests(unittest.TestCase):
             p for p in loop.generate_proposals([s1]) if p["target"]["kind"] == "mcp_server"
         ]
         self.assertEqual(proposals, [])
+
+    def test_statusless_successful_mcp_output_is_not_staged(self):
+        # Redacted from the successful CodeGraph calls rejected in the
+        # 20260716 triage batch. Result prose contained error-shaped words.
+        sessions = []
+        with tempfile.TemporaryDirectory() as td:
+            for session_index, call_count in enumerate((2, 1)):
+                path = Path(td) / f"codegraph-{session_index}.jsonl"
+                rows = []
+                for call_index in range(call_count):
+                    call_id = f"cg-{session_index}-{call_index}"
+                    rows.extend(
+                        [
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "custom_tool_call",
+                                    "name": "mcp__codegraph__codegraph_explore",
+                                    "call_id": call_id,
+                                    "input": '{"query":"error handling"}',
+                                },
+                            },
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "custom_tool_call_output",
+                                    "call_id": call_id,
+                                    "output": "Found 59 symbols including failure handlers",
+                                },
+                            },
+                        ]
+                    )
+                write_jsonl(path, rows)
+                sessions.append(loop.parse_codex_session(path))
+
+            proposals = [
+                p
+                for p in loop.generate_proposals(sessions)
+                if p["target"]["kind"] == "mcp_server"
+            ]
+
+            self.assertTrue(all(not session.failures for session in sessions))
+            self.assertEqual(proposals, [])
 
     def test_mcp_failures_in_subagent_transcripts_are_excluded(self):
         sub_path = "/tmp/proj/aaa/subagents/agent-1.jsonl"
