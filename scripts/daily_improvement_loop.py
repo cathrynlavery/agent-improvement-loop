@@ -1763,6 +1763,46 @@ def generate_proposals(
             )
         )
 
+    # MCP tool failures group by server: recurring failures usually mean
+    # expired auth, a broken server config, or a tool contract the agent keeps
+    # guessing wrong - the same "fix the tool, not the prompt" lesson as CLIs.
+    mcp_failures: Dict[str, List[Evidence]] = {}
+    for session in sessions:
+        if not INCLUDE_SUBAGENT_FAILURES and "/subagents/" in str(session.path):
+            continue
+        for fail in session.failures:
+            if not fail.tool_name.startswith("mcp__"):
+                continue
+            parts = fail.tool_name.split("__")
+            server = parts[1] if len(parts) > 1 and parts[1] else fail.tool_name
+            mcp_failures.setdefault(server, []).append(fail)
+    for server, failures in sorted(mcp_failures.items()):
+        session_count = len({f.session_id for f in failures})
+        if len(failures) < 3 or session_count < 2:
+            continue
+        tools = sorted({f.tool_name for f in failures})
+        shown = ", ".join(tools[:4]) + ("..." if len(tools) > 4 else "")
+        proposals.append(
+            make_proposal(
+                route="tool",
+                title=f"Review mcp:{server} tool failures from real use",
+                summary=(
+                    f"MCP server {server}: {len(failures)} failed tool call(s) across "
+                    f"{session_count} session(s) ({shown})."
+                ),
+                target_kind="mcp_server",
+                target_name=f"mcp:{server}",
+                evidence_items=failures[:12],
+                suggested_action=(
+                    "Review the failed calls. Recurring MCP failures usually mean expired "
+                    "auth, a broken server config, or a tool schema the agent keeps "
+                    "guessing wrong. Fix the server setup or its tool contract instead of "
+                    "prompting around it."
+                ),
+                impact=["shorter", "safer", "more_correct"],
+            )
+        )
+
     if include_content:
         proposals.extend(generate_content_proposals(sessions))
 
@@ -2018,6 +2058,43 @@ def write_review_packet(
     return path
 
 
+TARGET_HISTORY_KEEP = 10
+
+
+def annotate_recurrence(proposals: List[Dict[str, Any]], state: Dict[str, Any]) -> None:
+    """Mark proposals whose target was already flagged in previous runs.
+
+    A target that keeps coming back is the strongest reviewable signal this
+    loop produces, so recurring proposals are annotated and sorted to the top
+    of the packet. Recurrence is counted per route:target across runs, not per
+    evidence line, so fresh evidence for an old problem still reads as "still
+    broken", not "new problem".
+    """
+    history = state.get("target_run_history") or {}
+    for proposal in proposals:
+        key = f"{proposal['route']}:{proposal['target']['name']}"
+        prior = len(history.get(key) or [])
+        if prior:
+            proposal["recurrence"] = prior + 1
+            proposal["summary"] += f" Recurring: also flagged in {prior} previous run(s)."
+    proposals.sort(
+        key=lambda p: (-(p.get("recurrence") or 1), -len(p.get("evidence") or []))
+    )
+
+
+def update_target_history(
+    state: Dict[str, Any], proposals: List[Dict[str, Any]], run_id: str
+) -> None:
+    """Record which run detected each route:target, keeping a bounded window."""
+    history = state.setdefault("target_run_history", {})
+    for proposal in proposals:
+        key = f"{proposal['route']}:{proposal['target']['name']}"
+        runs = history.setdefault(key, [])
+        if run_id not in runs:
+            runs.append(run_id)
+        del runs[:-TARGET_HISTORY_KEEP]
+
+
 def filter_new_proposals(proposals: List[Dict[str, Any]], state: Dict[str, Any], include_seen: bool) -> List[Dict[str, Any]]:
     if include_seen:
         return proposals
@@ -2073,8 +2150,9 @@ def scan(args: argparse.Namespace) -> int:
 
     pp_root_arg = getattr(args, "printing_press_root", None)
     pp_root = Path(pp_root_arg).expanduser() if pp_root_arg else None
-    proposals = generate_proposals(sessions, pp_root, route=args.route)
-    proposals = filter_new_proposals(proposals, state, args.include_seen)
+    detected = generate_proposals(sessions, pp_root, route=args.route)
+    annotate_recurrence(detected, state)
+    proposals = filter_new_proposals(detected, state, args.include_seen)
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -2103,6 +2181,7 @@ def scan(args: argparse.Namespace) -> int:
 
     packet_path = write_review_packet(root, run_id, sessions, proposals, parser_warnings)
     state["schema_version"] = SCHEMA_VERSION
+    update_target_history(state, detected, run_id)
     state["last_scan_started_at"] = result["started_at"]
     state["last_run_id"] = run_id
     seen = set(state.get("seen_proposal_keys") or [])
