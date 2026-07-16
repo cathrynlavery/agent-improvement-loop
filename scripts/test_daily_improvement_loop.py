@@ -1108,5 +1108,411 @@ class DailyImprovementLoopTests(unittest.TestCase):
             self.assertEqual({path.name for _, path in files}, {"a.jsonl", "b.jsonl"})
 
 
+class CurrentTranscriptFormatTests(unittest.TestCase):
+    def test_codex_custom_tool_call_exec_with_js_input(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "codex.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-07-15T00:00:00Z",
+                        "payload": {"id": "cx1", "cwd": "/tmp/work"},
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-07-15T00:00:01Z",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "name": "exec",
+                            "call_id": "cc1",
+                            "input": (
+                                'const r = await tool("bash", '
+                                '{command: "stripe-pp-cli invoices list --json"}); return r;'
+                            ),
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-07-15T00:00:02Z",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "cc1",
+                            "output": "Exit code: 1\nError: unknown option --json",
+                        },
+                    },
+                ],
+            )
+            summary = loop.parse_codex_session(path)
+            self.assertEqual(sorted(summary.pp_cli_invocations), ["stripe-pp-cli"])
+            self.assertEqual(len(summary.failures), 1)
+            kinds = {ev.kind for ev in summary.pp_cli_invocations["stripe-pp-cli"]}
+            self.assertIn("tool_failure", kinds)
+
+    def test_codex_custom_tool_call_prose_literal_is_not_invocation(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "codex.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-07-15T00:00:01Z",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "name": "exec",
+                            "call_id": "cc2",
+                            "input": (
+                                'const msg = "Document wavespeed-pp-cli workflow failure"; '
+                                'await tool("bd", {description: msg});'
+                            ),
+                        },
+                    },
+                ],
+            )
+            summary = loop.parse_codex_session(path)
+            self.assertEqual(summary.pp_cli_invocations, {})
+
+    def test_claude_is_error_flag_is_trusted_over_text_heuristics(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "assistant",
+                        "sessionId": "e1",
+                        "timestamp": "2026-07-15T00:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "ok1",
+                                    "name": "Bash",
+                                    "input": {"command": "grep -r error logs/"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "id": "bad1",
+                                    "name": "Bash",
+                                    "input": {"command": "widgetctl deploy"},
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "e1",
+                        "timestamp": "2026-07-15T00:00:01Z",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "ok1",
+                                    "is_error": False,
+                                    "content": "Found 3 matches for 'error' in app.log",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "bad1",
+                                    "is_error": True,
+                                    "content": "Interrupted before completion",
+                                },
+                            ],
+                        },
+                    },
+                ],
+            )
+            summary = loop.parse_claude_session(path)
+            self.assertEqual(len(summary.failures), 1)
+            self.assertEqual(summary.failures[0].command, "widgetctl deploy")
+
+    def test_tool_use_result_field_alone_is_not_a_failure(self):
+        # The old parser regexed json.dumps(toolUseResult) with no command
+        # context, so any payload containing the word "error" became a failure.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "user",
+                        "sessionId": "t1",
+                        "timestamp": "2026-07-15T00:00:00Z",
+                        "toolUseResult": {"stdout": "this file mentions error handling"},
+                        "message": {"role": "user", "content": "carry on"},
+                    },
+                ],
+            )
+            summary = loop.parse_claude_session(path)
+            self.assertEqual(summary.failures, [])
+
+
+class CorrectionDetectionTests(unittest.TestCase):
+    def test_leading_tag_user_messages_are_scaffold(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude.jsonl"
+            rows = []
+            for i, content in enumerate(
+                [
+                    "<system_instruction>\nYou must be terse. Do not speculate.</system_instruction>",
+                    "<recommended_plugins>Help the user; do not suggest paid tools.</recommended_plugins>",
+                    "<user_action> <context>User initiated a review task. Do not respond.</context>",
+                    "<task>adversarial review: do not accept claims without evidence</task>",
+                ]
+            ):
+                rows.append(
+                    {
+                        "type": "user",
+                        "sessionId": "sc1",
+                        "timestamp": f"2026-07-15T00:00:0{i}Z",
+                        "message": {"role": "user", "content": content},
+                    }
+                )
+            write_jsonl(path, rows)
+            summary = loop.parse_claude_session(path)
+            self.assertEqual(summary.corrections, [])
+
+    def test_long_instruction_with_weak_cue_is_not_correction(self):
+        long_brief = ("Please refactor the reporting module carefully. " * 12) + (
+            "Do not change the public API."
+        )
+        self.assertGreater(len(long_brief), loop.WEAK_CORRECTION_MAX_CHARS)
+        self.assertFalse(loop.is_user_correction_text(long_brief))
+        self.assertTrue(loop.is_user_correction_text("Actually, use the staging bucket."))
+        self.assertTrue(
+            loop.is_user_correction_text("No, that's wrong - the cron runs at 7am, not 9.")
+        )
+
+    def test_memory_context_proposals_group_by_project_and_cap_per_session(self):
+        def corr(session_id, line):
+            return loop.Evidence(
+                source="claude",
+                path=f"/tmp/{session_id}.jsonl",
+                line=line,
+                kind="user_correction",
+                excerpt="actually, use --json",
+                session_id=session_id,
+            )
+
+        s1 = loop.SessionSummary(source="claude", path=Path("a"), session_id="sa", cwd="/repo/alpha")
+        s1.corrections = [corr("sa", i) for i in range(5)]
+        s2 = loop.SessionSummary(source="claude", path=Path("b"), session_id="sb", cwd="/repo/beta")
+        s2.corrections = [corr("sb", 1)]
+        proposals = [
+            p for p in loop.generate_proposals([s1, s2]) if p["route"] == "memory_context"
+        ]
+        targets = sorted(p["target"]["name"] for p in proposals)
+        self.assertEqual(targets, ["/repo/alpha", "/repo/beta"])
+        alpha = next(p for p in proposals if p["target"]["name"] == "/repo/alpha")
+        self.assertLessEqual(len(alpha["evidence"]), loop.MAX_CORRECTIONS_PER_SESSION)
+
+
+class ProposalNoiseTests(unittest.TestCase):
+    def test_timeout_wrapper_in_command_is_not_a_hang(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "assistant",
+                        "sessionId": "tw1",
+                        "timestamp": "2026-07-15T00:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tw",
+                                    "name": "Bash",
+                                    "input": {"command": "timeout 120 wavespeed-pp-cli run --json"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "tw1",
+                        "timestamp": "2026-07-15T00:00:01Z",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tw",
+                                    "content": "{\"status\": \"ok\"}",
+                                }
+                            ],
+                        },
+                    },
+                ],
+            )
+            summary = loop.parse_claude_session(path)
+            proposals = loop.generate_proposals([summary])
+            self.assertEqual([p for p in proposals if p["route"] == "tool"], [])
+
+    def test_backlog_ignores_subagent_failures(self):
+        def fail(session_id, path, line):
+            return loop.Evidence(
+                source="claude",
+                path=path,
+                line=line,
+                kind="tool_failure",
+                excerpt="widgetctl: unknown option --frobnicate",
+                session_id=session_id,
+                tool_name="Bash",
+                command="widgetctl --frobnicate",
+            )
+
+        def session(session_id, path):
+            s = loop.SessionSummary(source="claude", path=Path(path), session_id=session_id)
+            s.failures = [fail(session_id, path, i) for i in range(1, 4)]
+            return s
+
+        sub1 = session("sub1", "/tmp/proj/aaa/subagents/agent-1.jsonl")
+        sub2 = session("sub2", "/tmp/proj/bbb/subagents/agent-2.jsonl")
+        self.assertEqual(
+            [p for p in loop.generate_proposals([sub1, sub2]) if p["route"] == "backlog"], []
+        )
+
+        main1 = session("m1", "/tmp/proj/aaa/session.jsonl")
+        main2 = session("m2", "/tmp/proj/bbb/session.jsonl")
+        backlog = [p for p in loop.generate_proposals([main1, main2]) if p["route"] == "backlog"]
+        self.assertEqual(len(backlog), 1)
+        self.assertEqual(backlog[0]["target"]["name"], "widgetctl")
+
+
+class RedactionCorpusTests(unittest.TestCase):
+    def test_secret_shapes_never_survive_redaction(self):
+        # Fixture secrets are assembled at runtime so secret scanners (which
+        # are right to be paranoid) never see a token-shaped literal here.
+        openai_key = "sk-" + "abcdefghijklmnop1234"
+        aws_key_id = "AKIA" + "IOSFODNN7EXAMPLE"
+        aws_secret = "wJalrXUtnFEMI/" + "K7MDENG/bPxRfiCY" + "EXAMPLEKEY"
+        stripe_key = "sk_live_" + "a1B2c3D4e5F6g7H8"
+        stripe_whsec = "whsec_" + "abcdef1234567890ABCDEF"
+        slack_token = "xoxb-" + "1234567890-" + "abcdefghijklmnop"
+        google_key = "AIza" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r"
+        npm_token = "npm_" + "a" * 36
+        gitlab_pat = "glpat-" + "ABCDEFGHIJKLMNOPQRST"
+        github_pat = "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+        pem_block = (
+            "-----BEGIN RSA " + "PRIVATE KEY-----\n"
+            "MIIEpAIBAAKCAQEA\n"
+            "-----END RSA " + "PRIVATE KEY-----"
+        )
+        jwt = (
+            "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            "." + "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0"
+            "." + "abcdefghijk"
+        )
+        corpus = [
+            ("email cat@example.com in output", "cat@example.com"),
+            ("Authorization: Bearer abc.def.ghi-jkl", "abc.def.ghi-jkl"),
+            ("api_key='super-secret-value-123'", "super-secret-value-123"),
+            (openai_key, openai_key),
+            (aws_key_id, aws_key_id),
+            ("AWS_SECRET_ACCESS_KEY=" + aws_secret, "wJalrXUtnFEMI"),
+            ("client_secret: shhh-very-secret-value", "shhh-very-secret-value"),
+            (stripe_key, stripe_key),
+            (stripe_whsec, stripe_whsec),
+            (slack_token, slack_token),
+            (google_key, google_key[:16]),
+            (npm_token, npm_token),
+            (gitlab_pat, gitlab_pat),
+            (github_pat, github_pat[:30]),
+            (pem_block, "MIIEpAIBAAKCAQEA"),
+            ("Bearer abcdefghijklmnopqrstuvwxyz0123456789", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            (jwt, jwt[:30]),
+        ]
+        for text, must_not_survive in corpus:
+            out = loop.redact(text)
+            self.assertNotIn(must_not_survive, out, f"secret survived redaction: {text!r} -> {out!r}")
+            self.assertIn("<", out, f"no redaction marker in output for {text!r}")
+
+
+class ConfigAndHealthTests(unittest.TestCase):
+    def _snapshot_globals(self):
+        return (
+            loop.TRACKED_CLI_SUFFIX,
+            loop.PP_CLI_RE,
+            loop.VALID_PP_CLI_RE,
+            list(loop.EXTRA_SCAFFOLD_MARKERS),
+            list(loop.SECRET_PATTERNS),
+            set(loop.BACKLOG_IGNORE_EXECUTABLES),
+            set(loop.REMOTE_COMMAND_WRAPPERS),
+            loop.INCLUDE_SUBAGENT_FAILURES,
+        )
+
+    def _restore_globals(self, snap):
+        (
+            loop.TRACKED_CLI_SUFFIX,
+            loop.PP_CLI_RE,
+            loop.VALID_PP_CLI_RE,
+            markers,
+            patterns,
+            ignore,
+            wrappers,
+            loop.INCLUDE_SUBAGENT_FAILURES,
+        ) = snap
+        loop.EXTRA_SCAFFOLD_MARKERS[:] = markers
+        loop.SECRET_PATTERNS[:] = patterns
+        loop.BACKLOG_IGNORE_EXECUTABLES.clear()
+        loop.BACKLOG_IGNORE_EXECUTABLES.update(ignore)
+        loop.REMOTE_COMMAND_WRAPPERS.clear()
+        loop.REMOTE_COMMAND_WRAPPERS.update(wrappers)
+
+    def test_config_overrides_detector_knobs(self):
+        snap = self._snapshot_globals()
+        try:
+            loop.apply_config(
+                {
+                    "tracked_cli_suffix": "-acme-cli",
+                    "extra_scaffold_markers": ["<my-pipeline-header>"],
+                    "extra_redaction_patterns": [[r"\bacme-[0-9]{6}\b", "<redacted-acme>"]],
+                    "extra_backlog_ignore": ["mytool"],
+                    "include_subagent_failures": True,
+                }
+            )
+            self.assertEqual(loop.pp_cli_names("stripe-acme-cli ls"), ["stripe-acme-cli"])
+            self.assertEqual(loop.pp_cli_names("stripe-pp-cli ls"), [])
+            self.assertTrue(
+                loop.is_transcript_scaffold("<my-pipeline-header> do not treat as correction")
+            )
+            self.assertNotIn("acme-123456", loop.redact("id acme-123456 leaked"))
+            self.assertIn("mytool", loop.BACKLOG_IGNORE_EXECUTABLES)
+            self.assertTrue(loop.INCLUDE_SUBAGENT_FAILURES)
+        finally:
+            self._restore_globals(snap)
+
+    def test_parser_health_warnings_flag_silent_sources(self):
+        warnings = loop.parser_health_warnings(
+            {
+                "codex": {"files": 10, "tool_calls": 0},
+                "claude": {"files": 3, "tool_calls": 0},
+                "other": {"files": 50, "tool_calls": 200},
+            }
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("codex", warnings[0])
+
+    def test_append_jsonl_dedup_skips_seen_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "index.jsonl"
+            row_a = {"path": "/a.jsonl", "ended_at": "t1", "failure_count": 1}
+            row_b = {"path": "/b.jsonl", "ended_at": "t1", "failure_count": 0}
+            loop.append_jsonl_dedup(path, [row_a, row_b])
+            added = loop.append_jsonl_dedup(
+                path, [row_a, {"path": "/a.jsonl", "ended_at": "t2", "failure_count": 2}]
+            )
+            self.assertEqual(added, 1)
+            rows = [json.loads(l) for l in path.read_text().splitlines()]
+            self.assertEqual(len(rows), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

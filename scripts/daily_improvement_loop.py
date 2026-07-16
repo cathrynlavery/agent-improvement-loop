@@ -29,6 +29,7 @@ CONTENT_PRIVACY_NOTICE = (
     "customer/client details, family details, secrets, and exact sensitive data before publishing."
 )
 DEFAULT_OUTPUT_ROOT = Path.home() / ".agent-improvement"
+DEFAULT_CONFIG_PATH = DEFAULT_OUTPUT_ROOT / "config.json"
 
 # When True (via --full), keep full, unredacted excerpts inline. Default masks
 # secrets and shortens excerpts so the written output is safe to commit, sync,
@@ -36,30 +37,53 @@ DEFAULT_OUTPUT_ROOT = Path.home() / ".agent-improvement"
 FULL_DETAIL = False
 FULL_EXCERPT_LIMIT = 4000
 
-PP_CLI_RE = re.compile(
-    r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9._-]*-pp-cli)(?=$|[\s;&|)])"
-)
-# Anchored form, used to reject malformed names the tokenizer can pick up from
-# shell quoting or transcript scaffolding (e.g. "'wavespeed-pp-cli", "$c-pp-cli",
-# "===x-twitter-pp-cli") before they ever become a proposal.
-VALID_PP_CLI_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*-pp-cli$")
+# CLIs whose command name ends in this suffix get the `tool` route. Override
+# with "tracked_cli_suffix" in the config file to track your own naming scheme.
+TRACKED_CLI_SUFFIX = "-pp-cli"
+
+
+def _build_tracked_cli_res(suffix: str) -> Tuple[re.Pattern[str], re.Pattern[str]]:
+    esc = re.escape(suffix)
+    loose = re.compile(rf"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9._-]*{esc})(?=$|[\s;&|)])")
+    # Anchored form, used to reject malformed names the tokenizer can pick up
+    # from shell quoting or transcript scaffolding (e.g. "'wavespeed-pp-cli",
+    # "$c-pp-cli", "===x-twitter-pp-cli") before they ever become a proposal.
+    anchored = re.compile(rf"^[A-Za-z0-9][A-Za-z0-9._-]*{esc}$")
+    return loose, anchored
+
+
+PP_CLI_RE, VALID_PP_CLI_RE = _build_tracked_cli_res(TRACKED_CLI_SUFFIX)
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*")
 SHELL_SEPARATORS = {";", "&&", "||", "|", "do", "then", "else"}
 COMMAND_PREFIXES = {"command", "env", "noglob", "time"}
 REMOTE_COMMAND_WRAPPERS = {"bash", "kssh", "kssh_once", "sh", "ssh", "zsh"}
 SLASH_COMMAND_RE = re.compile(r"(?m)^\s*/([a-z][A-Za-z0-9:_-]*)\b")
-CORRECTION_RE = re.compile(
+# Corrections are split into strong cues (explicitly corrective phrases) and
+# weak cues (words that also appear constantly in ordinary specs and prompts —
+# "do not", "instead", "actually"). Weak cues only count in short, reactive
+# messages; a long task brief containing "do NOT change anything" is an
+# instruction, not a correction.
+STRONG_CORRECTION_RE = re.compile(
     r"\b("
-    r"actually|no,? that'?s wrong|that's wrong|that is wrong|not what i asked|"
-    r"you missed|don't do|do not|never do|stop doing|instead|should have|"
-    r"why did you|i meant|remember this"
+    r"no,? that'?s wrong|that'?s wrong|that is wrong|not what i asked|"
+    r"you missed|never do|stop doing|you should have|why did you|"
+    r"i meant|remember this"
     r")\b",
     re.IGNORECASE,
 )
+WEAK_CORRECTION_RE = re.compile(
+    r"\b(actually|instead|don'?t do|do not|should have)\b",
+    re.IGNORECASE,
+)
+STRONG_CORRECTION_MAX_CHARS = 2000
+WEAK_CORRECTION_MAX_CHARS = 400
+# Cap correction evidence carried per session so one noisy session cannot
+# dominate a memory/context proposal.
+MAX_CORRECTIONS_PER_SESSION = 3
 # Pasted call/meeting transcripts (speaker-tagged or timestamped dialogue) are
 # source material the user is relaying, not a correction of the agent. The
 # transcript body routinely contains weak trigger words ("actually", "instead")
-# that would otherwise match CORRECTION_RE.
+# that would otherwise count as correction cues.
 TRANSCRIPT_SPEAKER_RE = re.compile(r"<b>\s*speaker\s*\d+", re.IGNORECASE)
 TRANSCRIPT_TIMESTAMP_RE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\]")
 FAILURE_RE = re.compile(
@@ -284,12 +308,47 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     ),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "<redacted-openai-key>"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<redacted-aws-key>"),
+    (
+        re.compile(
+            r"(?i)\b(aws_?secret_?access_?key|secret_?access_?key|client_?secret|"
+            r"access_?token|refresh_?token)([\"'\s:=]+)([^\"'\s,;]{8,})"
+        ),
+        r"\1\2<redacted-secret>",
+    ),
+    (re.compile(r"\b[srp]k_(live|test)_[A-Za-z0-9]{16,}\b"), "<redacted-stripe-key>"),
+    (re.compile(r"\bwhsec_[A-Za-z0-9]{16,}\b"), "<redacted-stripe-key>"),
+    (re.compile(r"\bxox[abeprs]-[A-Za-z0-9-]{10,}\b"), "<redacted-slack-token>"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "<redacted-google-key>"),
+    (re.compile(r"\bnpm_[A-Za-z0-9]{30,}\b"), "<redacted-npm-token>"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"), "<redacted-gitlab-token>"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "<redacted-github-token>"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "<redacted-github-token>"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b"), "<redacted-jwt>"),
     (re.compile(r"(?<!\w)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\w)"), "<phone>"),
+    (
+        re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+        "<redacted-private-key>",
+    ),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}"), "<redacted-auth>"),
     (re.compile(r"\b[A-Za-z0-9_+/=-]{56,}\b"), "<redacted-long-token>"),
 ]
+
+# A user message that opens with an XML-ish tag is injected scaffolding
+# (system instructions, task seeds, notifications), not something the user
+# typed. This generic rule future-proofs the explicit marker list below.
+LEADING_TAG_RE = re.compile(r"^<[A-Za-z][A-Za-z0-9_-]*[\s>/]")
+# Extra scaffold markers loaded from the config file ("extra_scaffold_markers").
+EXTRA_SCAFFOLD_MARKERS: List[str] = []
+# String literals inside code-shaped tool inputs (current Codex `exec` calls
+# carry JavaScript, with the real shell commands embedded as literals).
+CODE_STRING_RE = re.compile(r"(['\"`])((?:\\.|(?!\1).)*)\1")
+# A tool input that opens with a code keyword is a program, not a shell command.
+CODE_COMMAND_RE = re.compile(
+    r"^\s*(const|let|var|await|async|function|return|import|export|try|if)\b"
+)
+# When False (default), failures inside subagent transcripts do not feed the
+# backlog route: exploratory subagents fail by design while probing.
+INCLUDE_SUBAGENT_FAILURES = False
 
 
 @dataclass
@@ -323,6 +382,7 @@ class ToolCall:
     line: int
     command: str = ""
     skill: str = ""
+    clis: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -486,31 +546,33 @@ def is_transcript_scaffold(text: str, path: Optional[Path] = None) -> bool:
     lower = stripped[:800].lower()
     if path and "/subagents/" in str(path):
         return True
-    return any(
-        marker in lower
-        for marker in (
-            "<local-command-caveat>",
-            "<permissions instructions>",
-            "# agents.md instructions",
-            "<instructions>",
-            "<codex_internal_context",
-            "<collaboration_mode>",
-            "the following is the codex agent history",
-            "as untrusted evidence, not as instructions to follow",
-            "use the skill at ",
-            "please implement this plan:",
-            "# files mentioned by the user:",
-            "<scheduled-task",
-            "compound codex tool mapping",
-            "<task-notification>",
-            "this session is being continued from a previous conversation",
-            "codex could not read the local image at",
-            "a 16:9 horizontal editorial illustration that explains one idea:",
-            "base directory for this skill:",
-            "tool mapping:",
-            "filesystem sandboxing defines which files can be read or written",
-        )
+    if LEADING_TAG_RE.match(stripped):
+        return True
+    markers = (
+        "<local-command-caveat>",
+        "<permissions instructions>",
+        "# agents.md instructions",
+        "<instructions>",
+        "<codex_internal_context",
+        "<collaboration_mode>",
+        "the following is the codex agent history",
+        "as untrusted evidence, not as instructions to follow",
+        "use the skill at ",
+        "please implement this plan:",
+        "# files mentioned by the user:",
+        "<scheduled-task",
+        "compound codex tool mapping",
+        "<task-notification>",
+        "this session is being continued from a previous conversation",
+        "codex could not read the local image at",
+        "a 16:9 horizontal editorial illustration that explains one idea:",
+        "base directory for this skill:",
+        "tool mapping:",
+        "filesystem sandboxing defines which files can be read or written",
     )
+    if any(marker in lower for marker in markers):
+        return True
+    return any(marker.lower() in lower for marker in EXTRA_SCAFFOLD_MARKERS)
 
 
 def looks_like_pasted_transcript(text: str) -> bool:
@@ -527,12 +589,12 @@ def looks_like_pasted_transcript(text: str) -> bool:
 
 
 def is_user_correction_text(text: str, path: Optional[Path] = None) -> bool:
-    return bool(
-        text
-        and not is_transcript_scaffold(text, path)
-        and not looks_like_pasted_transcript(text)
-        and CORRECTION_RE.search(text)
-    )
+    if not text or is_transcript_scaffold(text, path) or looks_like_pasted_transcript(text):
+        return False
+    stripped = text.strip()
+    if len(stripped) <= STRONG_CORRECTION_MAX_CHARS and STRONG_CORRECTION_RE.search(stripped):
+        return True
+    return len(stripped) <= WEAK_CORRECTION_MAX_CHARS and bool(WEAK_CORRECTION_RE.search(stripped))
 
 
 def add_pp_cli_evidence(summary: SessionSummary, cli: str, ev: Evidence) -> None:
@@ -540,7 +602,13 @@ def add_pp_cli_evidence(summary: SessionSummary, cli: str, ev: Evidence) -> None
 
 
 def capture_pp_cli_hang(
-    summary: SessionSummary, source: str, path: Path, line_no: int, command: str, output: str
+    summary: SessionSummary,
+    source: str,
+    path: Path,
+    line_no: int,
+    command: str,
+    output: str,
+    clis: Optional[List[str]] = None,
 ) -> None:
     """Record a non-failing pp-cli result that stalled or timed out.
 
@@ -550,7 +618,7 @@ def capture_pp_cli_hang(
     """
     if not output or not HANG_RE.search(output):
         return
-    for cli in pp_cli_names(command):
+    for cli in (clis if clis is not None else pp_cli_names(command)):
         add_pp_cli_evidence(
             summary,
             cli,
@@ -581,8 +649,26 @@ def pp_cli_names(command: str) -> List[str]:
     return sorted(_pp_cli_names(command or "", depth=0))
 
 
+def pp_cli_names_from_code(text: str) -> List[str]:
+    """Extract tracked-CLI names from string literals inside code-shaped input.
+
+    Current Codex sessions execute tools through a JavaScript runtime, so the
+    recorded input is code with the real shell commands embedded as string
+    literals. Each literal is tokenized like a shell command, so prose mentions
+    in argument position still do not count as invocations.
+    """
+    names: set[str] = set()
+    if TRACKED_CLI_SUFFIX not in (text or ""):
+        return []
+    for match in CODE_STRING_RE.finditer(text):
+        literal = match.group(2)
+        if TRACKED_CLI_SUFFIX in literal:
+            names.update(_pp_cli_names(literal, depth=1))
+    return sorted(names)
+
+
 def _pp_cli_names(command: str, depth: int) -> set[str]:
-    if depth > 2 or "-pp-cli" not in command:
+    if depth > 2 or TRACKED_CLI_SUFFIX not in command:
         return set()
 
     names: set[str] = set()
@@ -607,22 +693,22 @@ def _pp_cli_names(command: str, depth: int) -> set[str]:
 
             current_executable = basename
             command_expected = False
-            if basename.endswith("-pp-cli"):
+            if basename.endswith(TRACKED_CLI_SUFFIX):
                 names.add(basename)
                 continue
             if basename in REMOTE_COMMAND_WRAPPERS:
                 for nested in tokens[index + 1 :]:
-                    if "-pp-cli" in nested:
+                    if TRACKED_CLI_SUFFIX in nested:
                         names.update(_pp_cli_names(nested, depth + 1))
                 continue
 
         if current_executable == "source":
             if basename in {"kssh", "kssh_once"}:
                 for nested in tokens[index + 1 :]:
-                    if "-pp-cli" in nested:
+                    if TRACKED_CLI_SUFFIX in nested:
                         names.update(_pp_cli_names(nested, depth + 1))
                 continue
-        if current_executable in REMOTE_COMMAND_WRAPPERS and "-pp-cli" in token:
+        if current_executable in REMOTE_COMMAND_WRAPPERS and TRACKED_CLI_SUFFIX in token:
             names.update(_pp_cli_names(token, depth + 1))
 
     names.update(pp_cli_names_from_for_loop(command))
@@ -639,10 +725,10 @@ def pp_cli_names_from_for_loop(command: str) -> set[str]:
     return names
 
 
-def is_failure_text(text: str, command: str = "") -> bool:
+def is_failure_text(text: str, command: str = "", clis: Optional[List[str]] = None) -> bool:
     if not text:
         return False
-    pp_names = pp_cli_names(command)
+    pp_names = pp_cli_names(command) if clis is None else clis
     if BAD_EXIT_RE.search(text):
         return True
     if GOOD_EXIT_RE.search(text):
@@ -656,12 +742,14 @@ def is_failure_text(text: str, command: str = "") -> bool:
     return bool(FAILURE_RE.search(text))
 
 
-def pp_cli_failures_for_output(command: str, output: str) -> List[str]:
-    clis = pp_cli_names(command)
-    if not clis or not is_failure_text(output, command):
+def pp_cli_failures_for_output(
+    command: str, output: str, clis: Optional[List[str]] = None
+) -> List[str]:
+    clis = pp_cli_names(command) if clis is None else clis
+    if not clis or not is_failure_text(output, command, clis):
         return []
     if len(clis) == 1:
-        return clis
+        return list(clis)
 
     lines = output.splitlines()
     localized = set()
@@ -670,7 +758,7 @@ def pp_cli_failures_for_output(command: str, output: str) -> List[str]:
             if cli not in line:
                 continue
             window = "\n".join(lines[max(0, index - 1) : index + 3])
-            if is_failure_text(window, command) or PP_FRICTION_RE.search(window):
+            if is_failure_text(window, command, clis) or PP_FRICTION_RE.search(window):
                 localized.add(cli)
     return sorted(localized)
 
@@ -727,7 +815,14 @@ def parse_claude_session(path: Path) -> SessionSummary:
                     call_id = str(item.get("id") or f"{path}:{line_no}:{len(calls)}")
                     command = str(inp.get("command") or "")
                     skill = str(inp.get("skill") or "")
-                    call = ToolCall(call_id=call_id, name=name, line=line_no, command=command, skill=skill)
+                    call = ToolCall(
+                        call_id=call_id,
+                        name=name,
+                        line=line_no,
+                        command=command,
+                        skill=skill,
+                        clis=pp_cli_names(command) if name == "Bash" else [],
+                    )
                     calls[call_id] = call
                     summary.tool_calls.append(call)
                     if name == "Skill" and skill:
@@ -743,7 +838,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                             )
                         )
                     if name == "Bash" and command:
-                        for cli in pp_cli_names(command):
+                        for cli in call.clis:
                             add_pp_cli_evidence(
                                 summary,
                                 cli,
@@ -762,7 +857,17 @@ def parse_claude_session(path: Path) -> SessionSummary:
                     call_id = str(item.get("tool_use_id") or "")
                     call = calls.get(call_id)
                     result_text = text_from_tool_result(item.get("content"))
-                    if call and result_text and is_failure_text(result_text, call.command):
+                    # Claude Code marks failed tool calls explicitly; trust that
+                    # flag when present and fall back to text heuristics only
+                    # for older transcripts that lack it.
+                    is_err = item.get("is_error")
+                    if isinstance(is_err, bool):
+                        failed = is_err
+                    else:
+                        failed = bool(result_text) and is_failure_text(
+                            result_text, call.command if call else "", call.clis if call else None
+                        )
+                    if call and result_text and failed:
                         ev = evidence(
                             source="claude",
                             path=path,
@@ -775,33 +880,13 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         )
                         summary.failures.append(ev)
                         if call.name == "Bash":
-                            for cli in pp_cli_failures_for_output(call.command, result_text):
+                            clis = pp_cli_failures_for_output(call.command, result_text, call.clis)
+                            for cli in clis or (call.clis if is_err else []):
                                 add_pp_cli_evidence(summary, cli, ev)
                     elif call and result_text and call.name == "Bash":
                         capture_pp_cli_hang(
-                            summary, "claude", path, line_no, call.command, result_text
+                            summary, "claude", path, line_no, call.command, result_text, call.clis
                         )
-
-        tool_result = rec.get("toolUseResult")
-        if isinstance(tool_result, dict):
-            text = json.dumps(tool_result, sort_keys=True)
-            source_uuid = str(rec.get("sourceToolAssistantUUID") or "")
-            if text and is_failure_text(text):
-                call = next((c for c in calls.values() if c.call_id == source_uuid), None)
-                command = call.command if call else ""
-                tool_name = call.name if call else ""
-                summary.failures.append(
-                    evidence(
-                        source="claude",
-                        path=path,
-                        line=line_no,
-                        kind="tool_failure",
-                        text=text,
-                        session_id=summary.session_id,
-                        tool_name=tool_name,
-                        command=command,
-                    )
-                )
 
     return summary
 
@@ -883,16 +968,25 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     )
                 )
 
-        if payload.get("type") == "function_call":
+        payload_type = payload.get("type")
+        if payload_type in {"function_call", "custom_tool_call"}:
             name = str(payload.get("name") or "")
             call_id = str(payload.get("call_id") or f"{path}:{line_no}:{len(calls)}")
-            args = parse_json_maybe(payload.get("arguments"))
-            command = str(args.get("cmd") or args.get("command") or "")
-            call = ToolCall(call_id=call_id, name=name, line=line_no, command=command)
+            if payload_type == "custom_tool_call":
+                # Newer Codex sessions execute tools through a code runtime:
+                # the input is a raw string (often JavaScript) with the real
+                # shell commands embedded as string literals.
+                command = str(payload.get("input") or "")
+                clis = sorted(set(pp_cli_names(command)) | set(pp_cli_names_from_code(command)))
+            else:
+                args = parse_json_maybe(payload.get("arguments"))
+                command = str(args.get("cmd") or args.get("command") or "")
+                clis = pp_cli_names(command)
+            call = ToolCall(call_id=call_id, name=name, line=line_no, command=command, clis=clis)
             calls[call_id] = call
             summary.tool_calls.append(call)
             if command:
-                for cli in pp_cli_names(command):
+                for cli in clis:
                     add_pp_cli_evidence(
                         summary,
                         cli,
@@ -907,11 +1001,11 @@ def parse_codex_session(path: Path) -> SessionSummary:
                             command=command,
                         ),
                     )
-        elif payload.get("type") == "function_call_output":
+        elif payload_type in {"function_call_output", "custom_tool_call_output"}:
             call_id = str(payload.get("call_id") or "")
             call = calls.get(call_id)
             output = str(payload.get("output") or "")
-            if call and output and is_failure_text(output, call.command):
+            if call and output and is_failure_text(output, call.command, call.clis):
                 ev = evidence(
                     source="codex",
                     path=path,
@@ -923,10 +1017,12 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     command=call.command,
                 )
                 summary.failures.append(ev)
-                for cli in pp_cli_failures_for_output(call.command, output):
+                for cli in pp_cli_failures_for_output(call.command, output, call.clis):
                     add_pp_cli_evidence(summary, cli, ev)
             elif call and output:
-                capture_pp_cli_hang(summary, "codex", path, line_no, call.command, output)
+                capture_pp_cli_hang(
+                    summary, "codex", path, line_no, call.command, output, call.clis
+                )
 
     return summary
 
@@ -1470,9 +1566,9 @@ def printing_press_source(cli: str, pp_root: Optional[Path]) -> Optional[Path]:
     on disk keeps the default safe: on a machine with no printing-press tree the
     proposal simply omits the source line instead of inventing a path.
     """
-    if not pp_root or not cli.endswith("-pp-cli"):
+    if not pp_root or not cli.endswith(TRACKED_CLI_SUFFIX):
         return None
-    name = cli[: -len("-pp-cli")]
+    name = cli[: -len(TRACKED_CLI_SUFFIX)]
     for candidate in (pp_root / "library" / name, pp_root / "manuscripts" / name, pp_root / name):
         try:
             if candidate.is_dir():
@@ -1505,9 +1601,12 @@ def generate_proposals(
             # spread across days.
             pp_max_retries[cli] = max(pp_max_retries.get(cli, 0), len(items))
             for item in items:
-                if item.kind == "tool_failure" or is_failure_text(item.excerpt, item.command):
+                # Classify strictly by the kind assigned at parse time. Regexing
+                # the excerpt here would re-scan invocation excerpts, which are
+                # command text: `timeout 120 foo-pp-cli ...` is not a hang.
+                if item.kind == "tool_failure":
                     pp_failures.setdefault(cli, []).append(item)
-                elif item.kind == "pp_cli_hang" or HANG_RE.search(item.excerpt or ""):
+                elif item.kind == "pp_cli_hang":
                     pp_hangs.setdefault(cli, []).append(item)
 
     flagged_clis = sorted(
@@ -1598,22 +1697,28 @@ def generate_proposals(
             )
         )
 
-    correction_only: List[Evidence] = []
+    # Corrections not tied to a skill are grouped per project (cwd), so the
+    # review question becomes "what line in THIS project's CLAUDE.md/AGENTS.md
+    # would have prevented this", and one busy session cannot flood the packet.
+    corrections_by_project: Dict[str, List[Evidence]] = {}
     for session in sessions:
         if session.corrections and not session.skill_invocations:
-            correction_only.extend(session.corrections)
-    if correction_only:
+            corrections_by_project.setdefault(session.cwd or "unknown-project", []).extend(
+                session.corrections[:MAX_CORRECTIONS_PER_SESSION]
+            )
+    for project, items in sorted(corrections_by_project.items()):
+        label = Path(project).name if project != "unknown-project" else project
         proposals.append(
             make_proposal(
                 route="memory_context",
-                title="Review durable user/project preference corrections",
+                title=f"Review durable corrections for {label}",
                 summary=(
-                    f"{len(correction_only)} correction signal(s) were not tied to a "
-                    "specific invoked skill."
+                    f"{len(items)} correction signal(s) in sessions under {project} "
+                    "were not tied to a specific invoked skill."
                 ),
                 target_kind="memory_or_runbook",
-                target_name="unrouted-corrections",
-                evidence_items=correction_only[:12],
+                target_name=project,
+                evidence_items=items[:12],
                 suggested_action=(
                     "Classify each correction as durable preference, project runbook "
                     "update, or one-off incident. Stage AGENTS.md/CLAUDE.md/memory edits "
@@ -1625,9 +1730,13 @@ def generate_proposals(
 
     repeated_failures: Dict[str, List[Evidence]] = {}
     for session in sessions:
+        if not INCLUDE_SUBAGENT_FAILURES and "/subagents/" in str(session.path):
+            # Exploratory subagents fail by design while probing; their
+            # failures are not evidence of a durable tooling gap.
+            continue
         for fail in session.failures:
             executable = backlog_executable(fail.command)
-            if executable and not executable.endswith("-pp-cli"):
+            if executable and not executable.endswith(TRACKED_CLI_SUFFIX):
                 repeated_failures.setdefault(executable, []).append(fail)
     for executable, failures in sorted(repeated_failures.items()):
         durable_failures = [f for f in failures if TOOLING_FRICTION_RE.search(f.excerpt)]
@@ -1681,6 +1790,10 @@ def first_executable(command: str) -> str:
 def backlog_executable(command: str) -> str:
     if not command:
         return ""
+    if CODE_COMMAND_RE.match(command):
+        # Code-shaped input (current Codex exec calls carry JavaScript): there
+        # is no shell executable to blame, so it cannot feed the backlog route.
+        return ""
     candidates = re.split(r"\s*(?:&&|\|\||;|\||\n)\s*", command)
     fallback = ""
     for candidate in candidates:
@@ -1711,6 +1824,67 @@ def dedupe_proposals(proposals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def load_config(path: Path) -> Dict[str, Any]:
+    """Read the optional JSON config file; missing or malformed means defaults."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def apply_config(cfg: Dict[str, Any]) -> None:
+    """Apply config overrides to the module-level detector knobs.
+
+    Recognized keys: tracked_cli_suffix, extra_scaffold_markers,
+    extra_redaction_patterns ([[regex, replacement], ...]),
+    extra_backlog_ignore, extra_remote_command_wrappers,
+    include_subagent_failures.
+    """
+    global TRACKED_CLI_SUFFIX, PP_CLI_RE, VALID_PP_CLI_RE, INCLUDE_SUBAGENT_FAILURES
+    suffix = cfg.get("tracked_cli_suffix")
+    if isinstance(suffix, str) and suffix:
+        TRACKED_CLI_SUFFIX = suffix
+        PP_CLI_RE, VALID_PP_CLI_RE = _build_tracked_cli_res(suffix)
+    markers = cfg.get("extra_scaffold_markers")
+    if isinstance(markers, list):
+        EXTRA_SCAFFOLD_MARKERS.extend(str(m) for m in markers if m)
+    patterns = cfg.get("extra_redaction_patterns")
+    if isinstance(patterns, list):
+        for entry in patterns:
+            if not (isinstance(entry, list) and len(entry) == 2):
+                continue
+            try:
+                SECRET_PATTERNS.append((re.compile(str(entry[0])), str(entry[1])))
+            except re.error as exc:
+                print(f"warning: bad redaction pattern {entry[0]!r}: {exc}", file=sys.stderr)
+    ignore = cfg.get("extra_backlog_ignore")
+    if isinstance(ignore, list):
+        BACKLOG_IGNORE_EXECUTABLES.update(str(x) for x in ignore)
+    wrappers = cfg.get("extra_remote_command_wrappers")
+    if isinstance(wrappers, list):
+        REMOTE_COMMAND_WRAPPERS.update(str(x) for x in wrappers)
+    if isinstance(cfg.get("include_subagent_failures"), bool):
+        INCLUDE_SUBAGENT_FAILURES = cfg["include_subagent_failures"]
+
+
+def parser_health_warnings(stats: Dict[str, Dict[str, int]]) -> List[str]:
+    """Flag a source whose transcripts parse but yield no tool calls.
+
+    This is the failure mode that actually bit: a transcript schema change
+    (Codex moving to custom_tool_call) left the loop running green while
+    reading zero commands. Surface it instead of silently staging nothing.
+    """
+    warnings = []
+    for source, counts in sorted(stats.items()):
+        if counts.get("files", 0) >= 5 and counts.get("tool_calls", 0) == 0:
+            warnings.append(
+                f"{source}: {counts['files']} transcript(s) scanned but 0 tool calls "
+                "parsed - the parser may be stale for this source's current format."
+            )
+    return warnings
+
+
 def load_state(root: Path) -> Dict[str, Any]:
     path = root / "state.json"
     if not path.exists():
@@ -1739,11 +1913,38 @@ def append_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def append_jsonl_dedup(
+    path: Path, rows: List[Dict[str, Any]], key_fields: Tuple[str, ...] = ("path", "ended_at")
+) -> int:
+    """Append only rows whose key is not already present.
+
+    Overlapping scan windows re-index the same sessions run after run; without
+    this the session index grows with duplicate rows forever. A session that
+    gained new activity has a new ``ended_at`` and is appended again.
+    """
+    existing = set()
+    if path.exists():
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    existing.add(tuple(str(rec.get(k, "")) for k in key_fields))
+    fresh = [
+        row for row in rows if tuple(str(row.get(k, "")) for k in key_fields) not in existing
+    ]
+    append_jsonl(path, fresh)
+    return len(fresh)
+
+
 def write_review_packet(
     root: Path,
     run_id: str,
     sessions: List[SessionSummary],
     proposals: List[Dict[str, Any]],
+    parser_warnings: Optional[List[str]] = None,
 ) -> Path:
     path = root / "review-packets" / f"{run_id}.md"
     lines = [
@@ -1771,6 +1972,8 @@ def write_review_packet(
         "## Proposals",
         "",
     ]
+    if parser_warnings:
+        lines[-3:-3] = [f"- PARSER WARNING: {w}" for w in parser_warnings]
     if not proposals:
         lines.append("No proposals met the deterministic threshold.")
     for proposal in proposals:
@@ -1839,6 +2042,8 @@ def scan(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser()
     homes = [home] + [Path(item).expanduser() for item in getattr(args, "extra_home", [])]
     root = Path(args.output_root).expanduser()
+    config_path = Path(getattr(args, "config", "") or DEFAULT_CONFIG_PATH).expanduser()
+    apply_config(load_config(config_path))
     state = load_state(root)
     since = compute_since(args, state)
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1850,14 +2055,21 @@ def scan(args: argparse.Namespace) -> int:
         files = files[-args.max_sessions :]
 
     sessions: List[SessionSummary] = []
+    parse_stats: Dict[str, Dict[str, int]] = {}
     for source, path in files:
         try:
             parsed = parse_claude_session(path) if source == "claude" else parse_codex_session(path)
         except Exception as exc:
             print(f"warning: failed to parse {path}: {exc}", file=sys.stderr)
             continue
+        stats = parse_stats.setdefault(source, {"files": 0, "tool_calls": 0})
+        stats["files"] += 1
+        stats["tool_calls"] += len(parsed.tool_calls)
         if parsed.has_signal():
             sessions.append(parsed)
+    parser_warnings = parser_health_warnings(parse_stats)
+    for warning in parser_warnings:
+        print(f"warning: {warning}", file=sys.stderr)
 
     pp_root_arg = getattr(args, "printing_press_root", None)
     pp_root = Path(pp_root_arg).expanduser() if pp_root_arg else None
@@ -1873,6 +2085,8 @@ def scan(args: argparse.Namespace) -> int:
         "files_scanned": len(files),
         "sessions_with_signals": len(sessions),
         "proposal_count": len(proposals),
+        "parse_stats": parse_stats,
+        "parser_warnings": parser_warnings,
         "output_root": str(root),
     }
 
@@ -1881,13 +2095,13 @@ def scan(args: argparse.Namespace) -> int:
         return 0
 
     session_rows = [s.as_dict() for s in sessions]
-    append_jsonl(root / "session-index.jsonl", session_rows)
+    append_jsonl_dedup(root / "session-index.jsonl", session_rows)
 
     proposal_dir = root / "proposals" / run_id
     for proposal in proposals:
         write_json(proposal_dir / f"{proposal['proposal_id']}.json", proposal)
 
-    packet_path = write_review_packet(root, run_id, sessions, proposals)
+    packet_path = write_review_packet(root, run_id, sessions, proposals, parser_warnings)
     state["schema_version"] = SCHEMA_VERSION
     state["last_scan_started_at"] = result["started_at"]
     state["last_run_id"] = run_id
@@ -1932,6 +2146,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--printing-press-root",
         default=os.environ.get("PRINTING_PRESS_ROOT", PRINTING_PRESS_ROOT_DEFAULT),
         help="Root of the printing-press CLI tree; tool proposals point at the matching CLI source (default ~/printing-press)",
+    )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=(
+            "JSON config overriding detector defaults (tracked_cli_suffix, "
+            "extra_scaffold_markers, extra_redaction_patterns, extra_backlog_ignore, "
+            "extra_remote_command_wrappers, include_subagent_failures)"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print JSON and do not write queue files")
     return parser
