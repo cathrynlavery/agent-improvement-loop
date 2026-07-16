@@ -97,21 +97,16 @@ FAILURE_RE = re.compile(
 )
 BAD_EXIT_RE = re.compile(r"(?i)(process exited with code|exit code)[:\s]+[1-9]\d*\b")
 GOOD_EXIT_RE = re.compile(r"(?i)(process exited with code|exit code)[:\s]+0\b")
+COMPLETED_TOOL_RESULT_RE = re.compile(r"(?i)\bscript completed\b")
 PP_FRICTION_RE = re.compile(
     r"(?i)\b("
     r"FAIL|not configured|missing required|unknown option|usage:|"
     r"not found|invalid|unauthorized|forbidden|rate limit|silent null"
     r")\b"
 )
-PP_STRONG_FRICTION_RE = re.compile(
-    r"(?i)("
-    r"\bFAIL\b|\bnot configured\b|\bmissing required\b|"
-    r"\bunknown (option|flag)\b|\binvalid (option|flag|argument)\b|"
-    r"\bunauthorized\b|\bforbidden\b|\brate limit\b|\bsilent null\b|"
-    r"\baccepts at most\b|\bunexpected extra arg\b|error:|\bnot found\b"
-    r")"
+INSPECTION_COMMAND_RE = re.compile(
+    r"(?i)(^|\s)(--help|-h|--version|version|doctor|inventory)(?=$|\s|[;&|])"
 )
-HELP_COMMAND_RE = re.compile(r"(^|\s)(--help|-h)($|\s)")
 TOOLING_FRICTION_RE = re.compile(
     r"(?i)\b("
     r"unknown option|invalid option|usage:|command not found|no such file|"
@@ -129,9 +124,14 @@ HANG_RE = re.compile(
     r"killed|sigterm|sigkill"
     r")"
 )
-# A *-pp-cli invoked at least this many times in a single session is treated as
-# retry-before-success friction (the agent guessing syntax), even with no error.
+# A *-pp-cli invoked at least this many times in a single session can be
+# retry-before-success friction when corroborated by failure/hang evidence or
+# same-subcommand flag variation.
 RETRY_STUCK_THRESHOLD = 3
+# Reject code-literal-only names that cannot be resolved against an available
+# printing-press source tree. This is config-gated for installations that use
+# tracked CLI names without a local source checkout.
+VALIDATE_PP_CLI_CANDIDATES = True
 CONTENT_CLI_IGNORE = {
     "",
     "#",
@@ -339,12 +339,16 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
 LEADING_TAG_RE = re.compile(r"^<[A-Za-z][A-Za-z0-9_-]*[\s>/]")
 # Extra scaffold markers loaded from the config file ("extra_scaffold_markers").
 EXTRA_SCAFFOLD_MARKERS: List[str] = []
-# String literals inside code-shaped tool inputs (current Codex `exec` calls
-# carry JavaScript, with the real shell commands embedded as literals).
-CODE_STRING_RE = re.compile(r"(['\"`])((?:\\.|(?!\1).)*)\1")
+# Shell command literals inside current Codex runtime code. Restricting to
+# cmd/command properties avoids treating patch text, plan prose, and regex
+# arguments as executed CLI commands.
+CODE_SHELL_STRING_RE = re.compile(
+    r"(?<![\w.-])(?:['\"])?(?:cmd|command)(?:['\"])?\s*:\s*"
+    r"(['\"`])((?:\\.|(?!\1).)*)\1"
+)
 # A tool input that opens with a code keyword is a program, not a shell command.
 CODE_COMMAND_RE = re.compile(
-    r"^\s*(const|let|var|await|async|function|return|import|export|try|if)\b"
+    r"^\s*(?://[^\n]*\n\s*)*(const|let|var|await|async|function|return|import|export|try|if)\b"
 )
 # When False (default), failures inside subagent transcripts do not feed the
 # backlog route: exploratory subagents fail by design while probing.
@@ -618,6 +622,15 @@ def capture_pp_cli_hang(
     """
     if not output or not HANG_RE.search(output):
         return
+    # Runtime wrappers explicitly distinguish a completed call from one that
+    # is still running. Words such as "timeout" inside completed help output
+    # describe flags or docs; they are not evidence that the invocation hung.
+    if COMPLETED_TOOL_RESULT_RE.search(output) or GOOD_EXIT_RE.search(output):
+        return
+    # Older transcripts do not carry wrapper status. Keep inspection commands
+    # conservative: their output commonly documents timeouts and cancellation.
+    if INSPECTION_COMMAND_RE.search(command):
+        return
     for cli in (clis if clis is not None else pp_cli_names(command)):
         add_pp_cli_evidence(
             summary,
@@ -636,13 +649,40 @@ def capture_pp_cli_hang(
 
 
 def shell_tokens(command: str) -> List[str]:
-    lexer = shlex.shlex(command or "", posix=True, punctuation_chars=True)
+    # A shell newline terminates a command. Preserve that boundary before
+    # shlex consumes all whitespace, otherwise adjacent commands can fuse.
+    command = (command or "").replace("\n", " ; ").replace("\t", " ")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
         return list(lexer)
     except ValueError:
         return (command or "").split()
+
+
+def strip_heredoc_bodies(command: str) -> str:
+    """Remove shell heredoc payloads so prompt/code text is not executable."""
+    text = command or ""
+    search_from = 0
+    opener_re = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+    while True:
+        opener = opener_re.search(text, search_from)
+        if not opener:
+            return text
+        body_start = text.find("\n", opener.end())
+        if body_start < 0:
+            return text
+        delimiter = re.escape(opener.group(2))
+        terminator = re.search(
+            rf"(?m)^[ \t]*{delimiter}[ \t]*(?=['\"]?[ \t]*(?:\n|$))",
+            text[body_start + 1 :],
+        )
+        if not terminator:
+            return text[: body_start + 1]
+        term_start = body_start + 1 + terminator.start()
+        text = text[: body_start + 1] + text[term_start:]
+        search_from = body_start + 1
 
 
 def pp_cli_names(command: str) -> List[str]:
@@ -660,17 +700,71 @@ def pp_cli_names_from_code(text: str) -> List[str]:
     names: set[str] = set()
     if TRACKED_CLI_SUFFIX not in (text or ""):
         return []
-    for match in CODE_STRING_RE.finditer(text):
-        literal = match.group(2)
+    for match in CODE_SHELL_STRING_RE.finditer(text):
+        # JavaScript string literals preserve shell newlines/tabs as escape
+        # sequences in the transcript. POSIX shlex treats the backslash as an
+        # escape and would otherwise fuse `true\ncloudflare-pp-cli` into the
+        # fabricated command name `truencloudflare-pp-cli`.
+        literal = match.group(2).replace(r"\n", "\n").replace(r"\t", "\t")
         if TRACKED_CLI_SUFFIX in literal:
             names.update(_pp_cli_names(literal, depth=1))
     return sorted(names)
+
+
+def pp_cli_argv_shapes(command: str, cli: str) -> List[Tuple[str, Tuple[str, ...]]]:
+    """Return (subcommand, flags) shapes for a tracked CLI invocation.
+
+    Shape comparison deliberately ignores positional values. Retry evidence is
+    meant to catch syntax guessing (the same subcommand tried with different
+    flags), not repeated reads of different records.
+    """
+    candidates = [command]
+    if CODE_COMMAND_RE.match(command or ""):
+        candidates = [
+            match.group(2).replace(r"\n", "\n").replace(r"\t", "\t")
+            for match in CODE_SHELL_STRING_RE.finditer(command)
+            if cli in match.group(2)
+        ]
+
+    shapes: List[Tuple[str, Tuple[str, ...]]] = []
+    for candidate in candidates:
+        tokens = shell_tokens(candidate)
+        for index, token in enumerate(tokens):
+            if Path(token.strip()).name.strip() != cli:
+                continue
+            argv: List[str] = []
+            for arg in tokens[index + 1 :]:
+                if arg in SHELL_SEPARATORS:
+                    break
+                argv.append(arg)
+            subcommand_parts: List[str] = []
+            for arg in argv:
+                if arg.startswith("-"):
+                    break
+                subcommand_parts.append(arg)
+            subcommand = " ".join(subcommand_parts)
+            flags = tuple(
+                sorted({arg.split("=", 1)[0] for arg in argv if arg.startswith("-")})
+            )
+            shapes.append((subcommand, flags))
+    return shapes
+
+
+def has_retry_shape_variation(invocations: List[Evidence], cli: str) -> bool:
+    """True when one subcommand was tried with more than one flag shape."""
+    by_subcommand: Dict[str, set[Tuple[str, ...]]] = {}
+    for item in invocations:
+        for subcommand, flags in pp_cli_argv_shapes(item.command, cli):
+            if subcommand:
+                by_subcommand.setdefault(subcommand, set()).add(flags)
+    return any(len(flag_shapes) > 1 for flag_shapes in by_subcommand.values())
 
 
 def _pp_cli_names(command: str, depth: int) -> set[str]:
     if depth > 2 or TRACKED_CLI_SUFFIX not in command:
         return set()
 
+    command = strip_heredoc_bodies(command)
     names: set[str] = set()
     tokens = shell_tokens(command)
     command_expected = True
@@ -732,21 +826,36 @@ def is_failure_text(text: str, command: str = "", clis: Optional[List[str]] = No
     if BAD_EXIT_RE.search(text):
         return True
     if GOOD_EXIT_RE.search(text):
-        if pp_names and PP_STRONG_FRICTION_RE.search(text):
-            return True
         return False
     if pp_names:
-        if HELP_COMMAND_RE.search(command) and not PP_STRONG_FRICTION_RE.search(text):
-            return False
-        return bool(PP_STRONG_FRICTION_RE.search(text))
+        # Tracked CLI failures need an explicit status signal. Text-only
+        # friction is too ambiguous: help, doctor, inventory, truncated output,
+        # and deliberate auth/404 probes all contain error-shaped language.
+        return False
     return bool(FAILURE_RE.search(text))
 
 
+def tool_result_is_failure(
+    call: Optional[ToolCall], text: str, is_error: Optional[bool] = None
+) -> bool:
+    """Classify a result while requiring status for tracked CLI/MCP calls."""
+    if isinstance(is_error, bool):
+        return is_error
+    if not text:
+        return False
+    if call and (call.clis or call.name.startswith("mcp__")):
+        return bool(BAD_EXIT_RE.search(text))
+    return is_failure_text(text, call.command if call else "", call.clis if call else None)
+
+
 def pp_cli_failures_for_output(
-    command: str, output: str, clis: Optional[List[str]] = None
+    command: str,
+    output: str,
+    clis: Optional[List[str]] = None,
+    confirmed_failure: bool = False,
 ) -> List[str]:
     clis = pp_cli_names(command) if clis is None else clis
-    if not clis or not is_failure_text(output, command, clis):
+    if not clis or (not confirmed_failure and not is_failure_text(output, command, clis)):
         return []
     if len(clis) == 1:
         return list(clis)
@@ -758,7 +867,7 @@ def pp_cli_failures_for_output(
             if cli not in line:
                 continue
             window = "\n".join(lines[max(0, index - 1) : index + 3])
-            if is_failure_text(window, command, clis) or PP_FRICTION_RE.search(window):
+            if BAD_EXIT_RE.search(window) or PP_FRICTION_RE.search(window):
                 localized.add(cli)
     return sorted(localized)
 
@@ -858,15 +967,14 @@ def parse_claude_session(path: Path) -> SessionSummary:
                     call = calls.get(call_id)
                     result_text = text_from_tool_result(item.get("content"))
                     # Claude Code marks failed tool calls explicitly; trust that
-                    # flag when present and fall back to text heuristics only
-                    # for older transcripts that lack it.
+                    # flag when present. Older tracked CLI/MCP results require
+                    # an exit-code signal instead of ambiguous output text.
                     is_err = item.get("is_error")
-                    if isinstance(is_err, bool):
-                        failed = is_err
-                    else:
-                        failed = bool(result_text) and is_failure_text(
-                            result_text, call.command if call else "", call.clis if call else None
-                        )
+                    failed = tool_result_is_failure(
+                        call,
+                        result_text,
+                        is_err if isinstance(is_err, bool) else None,
+                    )
                     if call and result_text and failed:
                         ev = evidence(
                             source="claude",
@@ -880,8 +988,13 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         )
                         summary.failures.append(ev)
                         if call.name == "Bash":
-                            clis = pp_cli_failures_for_output(call.command, result_text, call.clis)
-                            for cli in clis or (call.clis if is_err else []):
+                            clis = pp_cli_failures_for_output(
+                                call.command,
+                                result_text,
+                                call.clis,
+                                confirmed_failure=True,
+                            )
+                            for cli in clis or call.clis:
                                 add_pp_cli_evidence(summary, cli, ev)
                     elif call and result_text and call.name == "Bash":
                         capture_pp_cli_hang(
@@ -977,7 +1090,12 @@ def parse_codex_session(path: Path) -> SessionSummary:
                 # the input is a raw string (often JavaScript) with the real
                 # shell commands embedded as string literals.
                 command = str(payload.get("input") or "")
-                clis = sorted(set(pp_cli_names(command)) | set(pp_cli_names_from_code(command)))
+                if CODE_COMMAND_RE.match(command):
+                    clis = pp_cli_names_from_code(command)
+                else:
+                    clis = sorted(
+                        set(pp_cli_names(command)) | set(pp_cli_names_from_code(command))
+                    )
             else:
                 args = parse_json_maybe(payload.get("arguments"))
                 command = str(args.get("cmd") or args.get("command") or "")
@@ -1005,7 +1123,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
             call_id = str(payload.get("call_id") or "")
             call = calls.get(call_id)
             output = str(payload.get("output") or "")
-            if call and output and is_failure_text(output, call.command, call.clis):
+            if call and output and tool_result_is_failure(call, output):
                 ev = evidence(
                     source="codex",
                     path=path,
@@ -1017,7 +1135,9 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     command=call.command,
                 )
                 summary.failures.append(ev)
-                for cli in pp_cli_failures_for_output(call.command, output, call.clis):
+                for cli in pp_cli_failures_for_output(
+                    call.command, output, call.clis, confirmed_failure=True
+                ):
                     add_pp_cli_evidence(summary, cli, ev)
             elif call and output:
                 capture_pp_cli_hang(
@@ -1578,6 +1698,21 @@ def printing_press_source(cli: str, pp_root: Optional[Path]) -> Optional[Path]:
     return None
 
 
+def pp_cli_candidate_is_valid(
+    cli: str, pp_root: Optional[Path], plain_command_clis: set[str]
+) -> bool:
+    """Conservatively reject unresolved names seen only in code literals."""
+    if not VALIDATE_PP_CLI_CANDIDATES or cli in plain_command_clis:
+        return True
+    # A missing/unavailable source checkout cannot disprove the candidate.
+    try:
+        if not pp_root or not pp_root.is_dir():
+            return True
+    except OSError:
+        return True
+    return printing_press_source(cli, pp_root) is not None
+
+
 def generate_proposals(
     sessions: List[SessionSummary], pp_root: Optional[Path] = None, route: str = "improvement"
 ) -> List[Dict[str, Any]]:
@@ -1589,17 +1724,18 @@ def generate_proposals(
     if not include_improvement and include_content:
         return generate_content_proposals(sessions)
 
-    pp_by_cli: Dict[str, List[Evidence]] = {}
+    pp_invocations: Dict[str, List[Evidence]] = {}
     pp_failures: Dict[str, List[Evidence]] = {}
     pp_hangs: Dict[str, List[Evidence]] = {}
     pp_max_retries: Dict[str, int] = {}
+    plain_command_clis: set[str] = set()
     for session in sessions:
+        for call in session.tool_calls:
+            if call.command and not CODE_COMMAND_RE.match(call.command):
+                plain_command_clis.update(pp_cli_names(call.command))
         for cli, items in session.pp_cli_invocations.items():
-            pp_by_cli.setdefault(cli, []).extend(items)
-            # Retries are counted per session: N invocations of the same CLI in
-            # one session is the agent guessing syntax, not normal repeat use
-            # spread across days.
-            pp_max_retries[cli] = max(pp_max_retries.get(cli, 0), len(items))
+            invocations = [item for item in items if item.kind == "pp_cli_invocation"]
+            pp_invocations.setdefault(cli, []).extend(invocations)
             for item in items:
                 # Classify strictly by the kind assigned at parse time. Regexing
                 # the excerpt here would re-scan invocation excerpts, which are
@@ -1609,6 +1745,26 @@ def generate_proposals(
                 elif item.kind == "pp_cli_hang":
                     pp_hangs.setdefault(cli, []).append(item)
 
+            # Retry-before-success is per CLI and session. Repetition alone is
+            # normal use; qualify it only when the same session has failure/hang
+            # evidence or one subcommand is tried with differing flag shapes.
+            by_session: Dict[str, List[Evidence]] = {}
+            signal_sessions = {
+                item.session_id
+                for item in items
+                if item.kind in {"tool_failure", "pp_cli_hang"}
+            }
+            for item in invocations:
+                by_session.setdefault(item.session_id, []).append(item)
+            for session_id, session_invocations in by_session.items():
+                count = len(session_invocations)
+                if count < RETRY_STUCK_THRESHOLD:
+                    continue
+                if session_id in signal_sessions or has_retry_shape_variation(
+                    session_invocations, cli
+                ):
+                    pp_max_retries[cli] = max(pp_max_retries.get(cli, 0), count)
+
     flagged_clis = sorted(
         cli
         for cli in (
@@ -1617,11 +1773,12 @@ def generate_proposals(
             | {cli for cli, count in pp_max_retries.items() if count >= RETRY_STUCK_THRESHOLD}
         )
         if VALID_PP_CLI_RE.match(cli)
+        and pp_cli_candidate_is_valid(cli, pp_root, plain_command_clis)
     )
     for cli in flagged_clis:
         failures = pp_failures.get(cli, [])
         hangs = pp_hangs.get(cli, [])
-        invocations = pp_by_cli.get(cli, [])
+        invocations = pp_invocations.get(cli, [])
         max_retries = pp_max_retries.get(cli, 0)
         stuck = max_retries >= RETRY_STUCK_THRESHOLD
         evidence_items = (failures + hangs + invocations)[:12]
@@ -1879,9 +2036,10 @@ def apply_config(cfg: Dict[str, Any]) -> None:
     Recognized keys: tracked_cli_suffix, extra_scaffold_markers,
     extra_redaction_patterns ([[regex, replacement], ...]),
     extra_backlog_ignore, extra_remote_command_wrappers,
-    include_subagent_failures.
+    include_subagent_failures, validate_pp_cli_candidates.
     """
-    global TRACKED_CLI_SUFFIX, PP_CLI_RE, VALID_PP_CLI_RE, INCLUDE_SUBAGENT_FAILURES
+    global TRACKED_CLI_SUFFIX, PP_CLI_RE, VALID_PP_CLI_RE
+    global INCLUDE_SUBAGENT_FAILURES, VALIDATE_PP_CLI_CANDIDATES
     suffix = cfg.get("tracked_cli_suffix")
     if isinstance(suffix, str) and suffix:
         TRACKED_CLI_SUFFIX = suffix
@@ -1906,6 +2064,8 @@ def apply_config(cfg: Dict[str, Any]) -> None:
         REMOTE_COMMAND_WRAPPERS.update(str(x) for x in wrappers)
     if isinstance(cfg.get("include_subagent_failures"), bool):
         INCLUDE_SUBAGENT_FAILURES = cfg["include_subagent_failures"]
+    if isinstance(cfg.get("validate_pp_cli_candidates"), bool):
+        VALIDATE_PP_CLI_CANDIDATES = cfg["validate_pp_cli_candidates"]
 
 
 def parser_health_warnings(stats: Dict[str, Dict[str, int]]) -> List[str]:
@@ -2232,7 +2392,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "JSON config overriding detector defaults (tracked_cli_suffix, "
             "extra_scaffold_markers, extra_redaction_patterns, extra_backlog_ignore, "
-            "extra_remote_command_wrappers, include_subagent_failures)"
+            "extra_remote_command_wrappers, include_subagent_failures, "
+            "validate_pp_cli_candidates)"
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print JSON and do not write queue files")
