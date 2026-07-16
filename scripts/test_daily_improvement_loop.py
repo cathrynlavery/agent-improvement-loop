@@ -1514,5 +1514,114 @@ class ConfigAndHealthTests(unittest.TestCase):
             self.assertEqual(len(rows), 3)
 
 
+class McpFailureTests(unittest.TestCase):
+    @staticmethod
+    def _failure(session_id, tool_name, path="/tmp/proj/session.jsonl", line=1):
+        return loop.Evidence(
+            source="claude",
+            path=path,
+            line=line,
+            kind="tool_failure",
+            excerpt="Not authenticated (401)",
+            session_id=session_id,
+            tool_name=tool_name,
+        )
+
+    @staticmethod
+    def _session(session_id, failures, path="/tmp/proj/session.jsonl"):
+        s = loop.SessionSummary(source="claude", path=Path(path), session_id=session_id)
+        s.failures = failures
+        return s
+
+    def test_repeated_mcp_failures_group_by_server(self):
+        s1 = self._session(
+            "m1",
+            [
+                self._failure("m1", "mcp__plaud__get_file", line=1),
+                self._failure("m1", "mcp__plaud__get_note", line=2),
+            ],
+        )
+        s2 = self._session("m2", [self._failure("m2", "mcp__plaud__get_file", line=3)])
+        proposals = [
+            p for p in loop.generate_proposals([s1, s2]) if p["target"]["kind"] == "mcp_server"
+        ]
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["route"], "tool")
+        self.assertEqual(proposals[0]["target"]["name"], "mcp:plaud")
+        self.assertIn("3 failed tool call(s)", proposals[0]["summary"])
+
+    def test_mcp_failures_below_threshold_are_not_staged(self):
+        # Two failures in one session: not enough sessions, not enough calls.
+        s1 = self._session(
+            "m3",
+            [
+                self._failure("m3", "mcp__notion__search", line=1),
+                self._failure("m3", "mcp__notion__search", line=2),
+            ],
+        )
+        proposals = [
+            p for p in loop.generate_proposals([s1]) if p["target"]["kind"] == "mcp_server"
+        ]
+        self.assertEqual(proposals, [])
+
+    def test_mcp_failures_in_subagent_transcripts_are_excluded(self):
+        sub_path = "/tmp/proj/aaa/subagents/agent-1.jsonl"
+        sessions = [
+            self._session(
+                f"sub{i}",
+                [self._failure(f"sub{i}", "mcp__plaud__get_file", path=sub_path, line=i)],
+                path=sub_path,
+            )
+            for i in range(3)
+        ]
+        proposals = [
+            p for p in loop.generate_proposals(sessions) if p["target"]["kind"] == "mcp_server"
+        ]
+        self.assertEqual(proposals, [])
+
+
+class RecurrenceTests(unittest.TestCase):
+    @staticmethod
+    def _proposal(route, target, evidence_count=1):
+        ev = loop.Evidence(
+            source="claude", path="/tmp/a.jsonl", line=1, kind="tool_failure", excerpt="x"
+        )
+        return loop.make_proposal(
+            route=route,
+            title=f"Review {target}",
+            summary=f"{target}: friction.",
+            target_kind="tool",
+            target_name=target,
+            evidence_items=[ev] * evidence_count,
+            suggested_action="review",
+            impact=["safer"],
+        )
+
+    def test_recurring_targets_are_annotated_and_sorted_first(self):
+        state = {
+            "target_run_history": {"tool:old-pp-cli": ["r1", "r2"]},
+        }
+        fresh = self._proposal("tool", "new-pp-cli", evidence_count=5)
+        recurring = self._proposal("tool", "old-pp-cli", evidence_count=1)
+        proposals = [fresh, recurring]
+        loop.annotate_recurrence(proposals, state)
+        self.assertEqual(proposals[0]["target"]["name"], "old-pp-cli")
+        self.assertEqual(proposals[0]["recurrence"], 3)
+        self.assertIn("2 previous run(s)", proposals[0]["summary"])
+        self.assertNotIn("recurrence", proposals[1])
+        self.assertNotIn("Recurring", proposals[1]["summary"])
+
+    def test_update_target_history_caps_window_and_dedupes_run_ids(self):
+        state = {}
+        proposal = self._proposal("tool", "old-pp-cli")
+        for i in range(12):
+            loop.update_target_history(state, [proposal], f"run{i}")
+        loop.update_target_history(state, [proposal], "run11")
+        runs = state["target_run_history"]["tool:old-pp-cli"]
+        self.assertEqual(len(runs), loop.TARGET_HISTORY_KEEP)
+        self.assertEqual(runs[-1], "run11")
+        self.assertEqual(runs[0], "run2")
+
+
 if __name__ == "__main__":
     unittest.main()

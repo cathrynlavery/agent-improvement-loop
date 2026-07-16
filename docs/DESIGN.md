@@ -27,13 +27,17 @@ Every transcript reduces to tool calls, CLI invocations, skill invocations, fail
 
 ## Routing
 
-- `tool`: real CLI use produced a failure/hang/retry signal. Fix the CLI contract.
+- `tool`: real CLI use produced a failure/hang/retry signal, or an MCP server accumulated repeated failed tool calls (grouped per server as `mcp:<server>`). Fix the CLI or server contract.
 - `skill_improvement`: a skill was invoked and the same session later contains a correction. Prefer patching the existing skill.
 - `memory_context`: corrections not tied to a skill, grouped per project (`cwd`) and capped per session, so one busy session cannot flood the packet. Promote only durable preferences or runbook facts.
 - `backlog`: repeated tool failures across sessions. Subagent transcripts are excluded by default (exploratory subagents fail by design), and code-runtime inputs are skipped because there is no shell executable to blame. Decide durable vs transient before creating a task.
 - `content_idea`: real workflows or moments worth considering for public content. Stage editorial proposals with audience, outline, last30days query, confidence, recommendation, and privacy notes; never draft or publish automatically. Detectors include high-signal slash commands, command-level workflow clusters, private-build signals, and aggregate usage stories such as top skills, most-used CLI tools, loop examples, and slash-command roundups when transcript data contains them.
 
 Proposal IDs are deterministic from route, target, and evidence references, so daily scans avoid restaging the same item unless `--include-seen` is passed.
+
+## Trends
+
+State keeps a bounded per-target history of which runs flagged each `route:target`. Proposals whose target already appeared in previous runs are annotated as recurring and sorted to the top of the packet. Recurrence counts runs, not evidence lines, so fresh evidence for an old problem reads as "still broken", not "new problem". Dry runs read the history but never write it.
 
 ## Self-checks
 
