@@ -54,6 +54,11 @@ agent-improvement-loop --since-days 1
 
 # Include logs copied from other machines
 ./bin/daily-improvement-loop --home ~/.agent-logs/laptop --extra-home ~/.agent-logs/desktop --route content_idea
+
+# Close a fixed target, inspect the registry, or reopen it
+./bin/daily-improvement-loop --resolve "tool:cloudflare-pp-cli" --decision fixed --pr 71 --note "Merged and verified"
+./bin/daily-improvement-loop --list-resolutions
+./bin/daily-improvement-loop --unresolve "tool:cloudflare-pp-cli"
 ```
 
 | Flag                                     | Meaning                                                                                                                                                                            |
@@ -64,6 +69,14 @@ agent-improvement-loop --since-days 1
 | `--source {all,claude,codex}`            | Which transcripts to read (default `all`)                                                                                                                                          |
 | `--route {all,improvement,content_idea}` | Stage operational improvements, content ideas, or both (default `improvement`)                                                                                                     |
 | `--include-seen`                         | Re-emit proposals even if their key was seen before                                                                                                                                |
+| `--include-resolved`                     | Debug bypass for the resolutions registry; seen-key filtering still applies unless `--include-seen` is also passed                                                                |
+| `--resolve ROUTE:TARGET`                 | Record a target resolution; requires `--decision`, with optional `--pr`, `--note`, `--by`, and `--resolved-at`                                                                    |
+| `--resolve-from PATH`                    | Import a structured `decisions.json` handoff                                                                                                                                       |
+| `--list-resolutions`                     | Print the human-editable resolutions registry                                                                                                                                      |
+| `--unresolve ROUTE:TARGET`               | Remove a target from the resolutions registry                                                                                                                                      |
+| `--decision {fixed,wontfix,ignored}`     | Outcome recorded with `--resolve`                                                                                                                                                  |
+| `--resolved-at TIMESTAMP`                | Override the resolution watermark (ISO8601 UTC; default now)                                                                                                                       |
+| `--pr VALUE`, `--note TEXT`, `--by NAME` | Add the fix reference, explanation, and recorder to a resolution                                                                                                                   |
 | `--full`                                 | Keep full, unredacted excerpts inline (local use only; do not share the output)                                                                                                    |
 | `--dry-run`                              | Print JSON, write nothing                                                                                                                                                          |
 | `--home PATH`                            | Home dir containing `.claude` / `.codex` (default `~`)                                                                                                                             |
@@ -76,6 +89,7 @@ agent-improvement-loop --since-days 1
 
 ```text
 ~/.agent-improvement/
+  resolutions.json               # durable route:target resolutions + watermarks
   state.json                     # last scan time + seen proposal keys
   session-index.jsonl            # one row per session with signals
   runs/<run-id>.json             # run metadata
@@ -90,6 +104,52 @@ By default the excerpts are short and secret-shaped strings are masked, so the q
 Each run also records per-source parse statistics, and warns loudly (stderr, run metadata, and the packet itself) when a source's transcripts parse but yield zero tool calls — the signature of a transcript format change that would otherwise silently blind the loop.
 
 Proposals whose target was already flagged in previous runs are marked as recurring ("also flagged in N previous run(s)") and sorted to the top of the packet — a target that keeps coming back is the strongest signal the loop produces.
+
+## Closing the loop / resolutions
+
+`state.json` answers “have I staged this exact evidence before?” Resolutions answer the stronger question: “has this target already been reviewed and closed?” They live separately in `~/.agent-improvement/resolutions.json`, so deleting or recovering a corrupt scan state cannot make completed work resurface.
+
+The registry is a human-editable JSON object keyed by `route:target`:
+
+```json
+{
+  "tool:cloudflare-pp-cli": {
+    "decision": "fixed",
+    "resolved_at": "2026-07-16T22:37:19+00:00",
+    "pr": "71",
+    "note": "Merged and verified",
+    "by": "reviewer"
+  }
+}
+```
+
+- `fixed` suppresses evidence at or before `resolved_at`, but evidence after that watermark is emitted as a regression and called out in its own review-packet section.
+- `wontfix` and `ignored` suppress the target regardless of evidence time. `--include-resolved` bypasses this for debugging.
+- `--include-seen` never bypasses a resolution. Use both debug flags when you intentionally want every resolved and previously seen proposal.
+- Recording a resolution trims that target's pre-resolution recurrence history. A later regression starts a new recurrence era.
+
+Each proposal carries `latest_evidence_at`, the maximum parsed event timestamp across its evidence. When a transcript format has no per-event timestamp, the loop uses the transcript file mtime, then a timestamp encoded in a Codex rollout filename. Runs report the count and target list for proposals suppressed as already resolved, so closure is visible rather than silent.
+
+Fix workflows can import a batch handoff with `--resolve-from decisions.json`. The schema is:
+
+```json
+{
+  "schema_version": 1,
+  "decisions": [
+    {
+      "proposal_id": "imp-c84cfef007115f5d918a",
+      "target": "tool:cloudflare-pp-cli",
+      "decision": "fixed",
+      "resolved_at": "2026-07-16T22:37:19Z",
+      "pr": "71",
+      "note": "Merged and verified",
+      "by": "reviewer"
+    }
+  ]
+}
+```
+
+`target` and `decision` are required. `resolved_at` defaults to import time; `pr`, `note`, `by`, and `proposal_id` provide the review trail. Leave deferred or still-open proposals out of the file.
 
 For `content_idea`, personal/private sessions are allowed as local source material, but the public output is intentionally conservative: high-risk content evidence suppresses command and excerpt text even when `--full` is enabled. Use the idea as a starting point, then remove names, raw messages, customer/client details, family details, auth material, exact private metrics, and any other identifying specifics before drafting or publishing.
 

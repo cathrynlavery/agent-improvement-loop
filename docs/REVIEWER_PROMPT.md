@@ -50,4 +50,31 @@ Final review format:
 ## Proposed Changes
 
 For each apply, show the exact patch or command. Stop before applying.
+
+After I approve and the fixes are implemented and verified, write a structured
+`decisions.json` handoff. Include only completed or deliberately closed targets;
+never include `defer`, still-open work, or work that has merely been proposed.
+
+Use this schema:
+
+{
+  "schema_version": 1,
+  "decisions": [
+    {
+      "proposal_id": "imp-example",
+      "target": "tool:example-pp-cli",
+      "decision": "fixed",
+      "resolved_at": "<ISO8601 UTC; omit to use import time>",
+      "pr": "<PR number or URL, or empty>",
+      "note": "<what was verified or why it was closed>",
+      "by": "<reviewer or fix workflow>"
+    }
+  ]
+}
+
+Map implemented and verified work to `fixed`, intentional durable non-fixes to
+`wontfix`, and false-positive, stale, or one-off signals to `ignored`. The
+`target` must be the packet's exact `route:target` key. Import the handoff with:
+
+./bin/daily-improvement-loop --resolve-from decisions.json
 ```
