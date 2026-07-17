@@ -30,6 +30,7 @@ CONTENT_PRIVACY_NOTICE = (
 )
 DEFAULT_OUTPUT_ROOT = Path.home() / ".agent-improvement"
 DEFAULT_CONFIG_PATH = DEFAULT_OUTPUT_ROOT / "config.json"
+RESOLUTION_DECISIONS = {"fixed", "wontfix", "ignored"}
 
 # When True (via --full), keep full, unredacted excerpts inline. Default masks
 # secrets and shortens excerpts so the written output is safe to commit, sync,
@@ -365,6 +366,7 @@ class Evidence:
     session_id: str = ""
     tool_name: str = ""
     command: str = ""
+    occurred_at: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -375,6 +377,7 @@ class Evidence:
             "kind": self.kind,
             "tool_name": self.tool_name,
             "command": self.command,
+            "occurred_at": self.occurred_at,
             "excerpt": self.excerpt,
         }
 
@@ -387,6 +390,7 @@ class ToolCall:
     command: str = ""
     skill: str = ""
     clis: List[str] = field(default_factory=list)
+    occurred_at: str = ""
 
 
 @dataclass
@@ -461,6 +465,45 @@ def file_mtime_utc(path: Path) -> dt.datetime:
     return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
 
 
+PATH_TIMESTAMP_RE = re.compile(
+    r"(?:rollout-)?(\d{4}-\d{2}-\d{2}T\d{2}[-:]\d{2}[-:]\d{2})(?:\.\d+)?Z?"
+)
+
+
+def isoformat_utc(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def evidence_time(ev: Evidence) -> Optional[dt.datetime]:
+    """Return the strongest available event time for an evidence item.
+
+    Parsed per-record transcript timestamps are authoritative. Older or
+    synthetic formats without one fall back to the transcript mtime, then a
+    timestamp encoded in a Codex rollout filename.
+    """
+    parsed = parse_time(ev.occurred_at)
+    if parsed:
+        return parsed
+    path = Path(ev.path).expanduser()
+    try:
+        if path.exists():
+            return file_mtime_utc(path)
+    except OSError:
+        pass
+    match = PATH_TIMESTAMP_RE.search(path.name)
+    if match:
+        date_part, time_part = match.group(1).split("T", 1)
+        parsed = parse_time(f"{date_part}T{time_part.replace('-', ':')}Z")
+        if parsed:
+            return parsed
+    return None
+
+
+def latest_evidence_time(evidence_items: List[Evidence]) -> Optional[dt.datetime]:
+    times = [value for value in (evidence_time(ev) for ev in evidence_items) if value]
+    return max(times) if times else None
+
+
 def shorten(text: str, limit: int = 360) -> str:
     if FULL_DETAIL:
         limit = max(limit, FULL_EXCERPT_LIMIT)
@@ -489,6 +532,7 @@ def evidence(
     session_id: str = "",
     tool_name: str = "",
     command: str = "",
+    occurred_at: Any = "",
 ) -> Evidence:
     return Evidence(
         source=source,
@@ -499,6 +543,7 @@ def evidence(
         session_id=session_id,
         tool_name=tool_name,
         command=shorten(redact(command), 220),
+        occurred_at=isoformat_utc(parsed) if (parsed := parse_time(occurred_at)) else "",
     )
 
 
@@ -613,6 +658,7 @@ def capture_pp_cli_hang(
     command: str,
     output: str,
     clis: Optional[List[str]] = None,
+    occurred_at: Any = "",
 ) -> None:
     """Record a non-failing pp-cli result that stalled or timed out.
 
@@ -644,6 +690,7 @@ def capture_pp_cli_hang(
                 session_id=summary.session_id,
                 tool_name="Bash",
                 command=command,
+                occurred_at=occurred_at,
             ),
         )
 
@@ -900,6 +947,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         kind="slash_command",
                         text=f"/{command}",
                         session_id=summary.session_id,
+                        occurred_at=ts,
                     )
                     summary.slash_commands.setdefault(command, []).append(ev)
                 if is_user_correction_text(text, path):
@@ -911,6 +959,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                             kind="user_correction",
                             text=text,
                             session_id=summary.session_id,
+                            occurred_at=ts,
                         )
                     )
 
@@ -931,6 +980,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         command=command,
                         skill=skill,
                         clis=pp_cli_names(command) if name == "Bash" else [],
+                        occurred_at=(isoformat_utc(parsed) if (parsed := parse_time(ts)) else ""),
                     )
                     calls[call_id] = call
                     summary.tool_calls.append(call)
@@ -944,6 +994,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                                 text=f"Skill({skill})",
                                 session_id=summary.session_id,
                                 tool_name=name,
+                                occurred_at=ts,
                             )
                         )
                     if name == "Bash" and command:
@@ -960,6 +1011,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                                     session_id=summary.session_id,
                                     tool_name=name,
                                     command=command,
+                                    occurred_at=ts,
                                 ),
                             )
                 elif item.get("type") == "tool_result":
@@ -985,6 +1037,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                             session_id=summary.session_id,
                             tool_name=call.name,
                             command=call.command,
+                            occurred_at=ts,
                         )
                         summary.failures.append(ev)
                         if call.name == "Bash":
@@ -998,7 +1051,14 @@ def parse_claude_session(path: Path) -> SessionSummary:
                                 add_pp_cli_evidence(summary, cli, ev)
                     elif call and result_text and call.name == "Bash":
                         capture_pp_cli_hang(
-                            summary, "claude", path, line_no, call.command, result_text, call.clis
+                            summary,
+                            "claude",
+                            path,
+                            line_no,
+                            call.command,
+                            result_text,
+                            call.clis,
+                            ts,
                         )
 
     return summary
@@ -1067,6 +1127,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     kind="slash_command",
                     text=f"/{command}",
                     session_id=summary.session_id,
+                    occurred_at=ts,
                 )
                 summary.slash_commands.setdefault(command, []).append(ev)
             if is_user_correction_text(text, path):
@@ -1078,6 +1139,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
                         kind="user_correction",
                         text=text,
                         session_id=summary.session_id,
+                        occurred_at=ts,
                     )
                 )
 
@@ -1100,7 +1162,14 @@ def parse_codex_session(path: Path) -> SessionSummary:
                 args = parse_json_maybe(payload.get("arguments"))
                 command = str(args.get("cmd") or args.get("command") or "")
                 clis = pp_cli_names(command)
-            call = ToolCall(call_id=call_id, name=name, line=line_no, command=command, clis=clis)
+            call = ToolCall(
+                call_id=call_id,
+                name=name,
+                line=line_no,
+                command=command,
+                clis=clis,
+                occurred_at=(isoformat_utc(parsed) if (parsed := parse_time(ts)) else ""),
+            )
             calls[call_id] = call
             summary.tool_calls.append(call)
             if command:
@@ -1117,6 +1186,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
                             session_id=summary.session_id,
                             tool_name=name,
                             command=command,
+                            occurred_at=ts,
                         ),
                     )
         elif payload_type in {"function_call_output", "custom_tool_call_output"}:
@@ -1133,6 +1203,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     session_id=summary.session_id,
                     tool_name=call.name,
                     command=call.command,
+                    occurred_at=ts,
                 )
                 summary.failures.append(ev)
                 for cli in pp_cli_failures_for_output(
@@ -1141,7 +1212,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     add_pp_cli_evidence(summary, cli, ev)
             elif call and output:
                 capture_pp_cli_hang(
-                    summary, "codex", path, line_no, call.command, output, call.clis
+                    summary, "codex", path, line_no, call.command, output, call.clis, ts
                 )
 
     return summary
@@ -1212,11 +1283,14 @@ def make_proposal(
     impact: List[str],
 ) -> Dict[str, Any]:
     key = proposal_key(route, target_kind, target_name, evidence_items)
+    created_at = utc_now()
+    latest = latest_evidence_time(evidence_items)
     return {
         "schema_version": SCHEMA_VERSION,
         "proposal_id": f"imp-{key}",
         "proposal_key": key,
-        "created_at": utc_now(),
+        "created_at": created_at,
+        "latest_evidence_at": isoformat_utc(latest) if latest else created_at,
         "status": "proposed",
         "route": route,
         "title": title,
@@ -1280,6 +1354,7 @@ def content_evidence_dicts(evidence_items: List[Evidence], privacy: Dict[str, An
                 "kind": ev.kind,
                 "tool_name": ev.tool_name,
                 "command": "<private workflow evidence redacted>",
+                "occurred_at": ev.occurred_at,
                 "excerpt": "<private workflow evidence redacted>",
             }
             for ev in evidence_items[:12]
@@ -1303,6 +1378,8 @@ def make_content_proposal(
 ) -> Dict[str, Any]:
     key = content_proposal_key(title, evidence_items)
     privacy = privacy_for_content(evidence_items)
+    created_at = utc_now()
+    latest = latest_evidence_time(evidence_items)
     if privacy["risk_level"] == "high" and recommendation == "write_now":
         recommendation = "needs_context"
         confidence = min(confidence, 0.72)
@@ -1310,7 +1387,8 @@ def make_content_proposal(
         "schema_version": SCHEMA_VERSION,
         "proposal_id": f"content-{key}",
         "proposal_key": key,
-        "created_at": utc_now(),
+        "created_at": created_at,
+        "latest_evidence_at": isoformat_utc(latest) if latest else created_at,
         "status": "proposed",
         "route": "content_idea",
         "title": title,
@@ -1370,6 +1448,7 @@ def workflow_evidence_from_tool_call(session: SessionSummary, call: ToolCall) ->
         session_id=session.session_id,
         tool_name=call.name,
         command=call.command,
+        occurred_at=call.occurred_at,
     )
 
 
@@ -2099,11 +2178,142 @@ def load_state(root: Path) -> Dict[str, Any]:
     return state
 
 
+def validate_resolution_target(target: Any) -> str:
+    value = str(target or "").strip()
+    route, separator, name = value.partition(":")
+    if not separator or not route or not name:
+        raise ValueError("resolution target must be route:target")
+    return value
+
+
+def normalize_resolution(entry: Dict[str, Any]) -> Dict[str, str]:
+    decision = str(entry.get("decision") or "").strip().lower()
+    if decision not in RESOLUTION_DECISIONS:
+        allowed = ", ".join(sorted(RESOLUTION_DECISIONS))
+        raise ValueError(f"resolution decision must be one of: {allowed}")
+    resolved = parse_time(entry.get("resolved_at"))
+    if not resolved:
+        raise ValueError("resolution resolved_at must be an ISO8601 timestamp")
+    return {
+        "decision": decision,
+        "resolved_at": isoformat_utc(resolved),
+        "pr": str(entry.get("pr") or "").strip(),
+        "note": str(entry.get("note") or "").strip(),
+        "by": str(entry.get("by") or "").strip(),
+    }
+
+
+def load_resolutions(root: Path) -> Dict[str, Dict[str, str]]:
+    path = root / "resolutions.json"
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} must contain a JSON object keyed by route:target")
+    resolutions: Dict[str, Dict[str, str]] = {}
+    for target, entry in raw.items():
+        target = validate_resolution_target(target)
+        if not isinstance(entry, dict):
+            raise ValueError(f"resolution for {target} must be a JSON object")
+        resolutions[target] = normalize_resolution(entry)
+    return resolutions
+
+
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def parse_run_id(value: Any) -> Optional[dt.datetime]:
+    try:
+        parsed = dt.datetime.strptime(str(value), "%Y%m%dT%H%M%SZ")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def trim_target_history(
+    state: Dict[str, Any], target: str, resolved_at: Any
+) -> None:
+    """Remove recurrence runs at or before a target's resolution watermark."""
+    watermark = parse_time(resolved_at)
+    if not watermark:
+        return
+    history = state.get("target_run_history")
+    if not isinstance(history, dict) or target not in history:
+        return
+    history[target] = [
+        run_id
+        for run_id in (history.get(target) or [])
+        if (run_time := parse_run_id(run_id)) is not None and run_time > watermark
+    ]
+    if not history[target]:
+        history.pop(target, None)
+
+
+def update_resolutions(
+    root: Path, updates: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, str]]:
+    resolutions = load_resolutions(root)
+    normalized: Dict[str, Dict[str, str]] = {}
+    for target, entry in updates.items():
+        target = validate_resolution_target(target)
+        normalized[target] = normalize_resolution(entry)
+    resolutions.update(normalized)
+    write_json(root / "resolutions.json", resolutions)
+
+    # A corrupt operational state must never erase or block the separate
+    # resolutions registry. Trim recurrence history only when state is valid.
+    state_path = root / "state.json"
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            state = None
+        if isinstance(state, dict):
+            for target, entry in normalized.items():
+                trim_target_history(state, target, entry["resolved_at"])
+            write_json(state_path, state)
+    return resolutions
+
+
+def remove_resolution(root: Path, target: str) -> Dict[str, Dict[str, str]]:
+    target = validate_resolution_target(target)
+    resolutions = load_resolutions(root)
+    if target not in resolutions:
+        raise ValueError(f"no resolution recorded for {target}")
+    del resolutions[target]
+    write_json(root / "resolutions.json", resolutions)
+    return resolutions
+
+
+def load_decision_import(path: Path, default_by: str = "") -> Dict[str, Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("decisions"), list):
+        raise ValueError("decisions import must be an object with a decisions array")
+    updates: Dict[str, Dict[str, Any]] = {}
+    for index, row in enumerate(payload["decisions"], 1):
+        if not isinstance(row, dict):
+            raise ValueError(f"decisions[{index}] must be a JSON object")
+        target = validate_resolution_target(row.get("target") or row.get("route_target"))
+        if target in updates:
+            raise ValueError(f"duplicate decisions entry for {target}")
+        updates[target] = {
+            "decision": row.get("decision"),
+            "resolved_at": row.get("resolved_at") or utc_now(),
+            "pr": row.get("pr") or "",
+            "note": row.get("note") or "",
+            "by": row.get("by") or default_by,
+        }
+    return updates
 
 
 def append_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
@@ -2145,8 +2355,14 @@ def write_review_packet(
     sessions: List[SessionSummary],
     proposals: List[Dict[str, Any]],
     parser_warnings: Optional[List[str]] = None,
+    resolution_suppressed: Optional[List[Dict[str, Any]]] = None,
+    regressions: Optional[List[Dict[str, Any]]] = None,
 ) -> Path:
     path = root / "review-packets" / f"{run_id}.md"
+    resolution_suppressed = resolution_suppressed or []
+    regressions = regressions or []
+    suppressed_targets = sorted({item["target"] for item in resolution_suppressed})
+    target_text = ", ".join(f"`{target}`" for target in suppressed_targets) or "none"
     lines = [
         f"# Daily Improvement Review Packet ({run_id})",
         "",
@@ -2168,12 +2384,26 @@ def write_review_packet(
         "",
         f"- Sessions with signals: {len(sessions)}",
         f"- Proposals staged this run: {len(proposals)}",
-        "",
-        "## Proposals",
+        (
+            f"- {len(resolution_suppressed)} proposals suppressed as already-resolved "
+            f"(targets: {target_text})"
+        ),
+        f"- Regressions re-opened after a fix: {len(regressions)}",
         "",
     ]
     if parser_warnings:
-        lines[-3:-3] = [f"- PARSER WARNING: {w}" for w in parser_warnings]
+        lines[-1:-1] = [f"- PARSER WARNING: {w}" for w in parser_warnings]
+    lines.extend(["## Regressions re-opened after a fix", ""])
+    if not regressions:
+        lines.append("None.")
+    for proposal in regressions:
+        regression = proposal["regression"]
+        lines.append(
+            f"- `{proposal['proposal_id']}` `{regression['target']}`: evidence at "
+            f"{regression['latest_evidence_at']} is newer than fix "
+            f"{regression['pr'] or '(no PR recorded)'} at {regression['fixed_at']}."
+        )
+    lines.extend(["", "## Proposals", ""])
     if not proposals:
         lines.append("No proposals met the deterministic threshold.")
     for proposal in proposals:
@@ -2221,7 +2451,15 @@ def write_review_packet(
 TARGET_HISTORY_KEEP = 10
 
 
-def annotate_recurrence(proposals: List[Dict[str, Any]], state: Dict[str, Any]) -> None:
+def proposal_target_key(proposal: Dict[str, Any]) -> str:
+    return f"{proposal['route']}:{proposal['target']['name']}"
+
+
+def annotate_recurrence(
+    proposals: List[Dict[str, Any]],
+    state: Dict[str, Any],
+    resolutions: Optional[Dict[str, Dict[str, str]]] = None,
+) -> None:
     """Mark proposals whose target was already flagged in previous runs.
 
     A target that keeps coming back is the strongest reviewable signal this
@@ -2231,9 +2469,19 @@ def annotate_recurrence(proposals: List[Dict[str, Any]], state: Dict[str, Any]) 
     broken", not "new problem".
     """
     history = state.get("target_run_history") or {}
+    resolutions = resolutions or {}
     for proposal in proposals:
-        key = f"{proposal['route']}:{proposal['target']['name']}"
-        prior = len(history.get(key) or [])
+        key = proposal_target_key(proposal)
+        runs = history.get(key) or []
+        resolution = resolutions.get(key)
+        watermark = parse_time(resolution.get("resolved_at")) if resolution else None
+        if watermark:
+            runs = [
+                run_id
+                for run_id in runs
+                if (run_time := parse_run_id(run_id)) is not None and run_time > watermark
+            ]
+        prior = len(runs)
         if prior:
             proposal["recurrence"] = prior + 1
             proposal["summary"] += f" Recurring: also flagged in {prior} previous run(s)."
@@ -2248,18 +2496,83 @@ def update_target_history(
     """Record which run detected each route:target, keeping a bounded window."""
     history = state.setdefault("target_run_history", {})
     for proposal in proposals:
-        key = f"{proposal['route']}:{proposal['target']['name']}"
+        key = proposal_target_key(proposal)
         runs = history.setdefault(key, [])
         if run_id not in runs:
             runs.append(run_id)
         del runs[:-TARGET_HISTORY_KEEP]
 
 
-def filter_new_proposals(proposals: List[Dict[str, Any]], state: Dict[str, Any], include_seen: bool) -> List[Dict[str, Any]]:
-    if include_seen:
-        return proposals
+@dataclass
+class ProposalFilterResult:
+    proposals: List[Dict[str, Any]]
+    suppressed: List[Dict[str, Any]]
+    regressions: List[Dict[str, Any]]
+    resolved_nonregressions: List[Dict[str, Any]]
+
+
+def filter_new_proposals(
+    proposals: List[Dict[str, Any]],
+    state: Dict[str, Any],
+    include_seen: bool,
+    resolutions: Optional[Dict[str, Dict[str, str]]] = None,
+    include_resolved: bool = False,
+) -> ProposalFilterResult:
+    """Apply durable resolutions first, then ordinary seen-key deduplication."""
+    resolutions = resolutions or {}
     seen = set(state.get("seen_proposal_keys") or [])
-    return [p for p in proposals if p.get("proposal_key") not in seen]
+    emitted: List[Dict[str, Any]] = []
+    suppressed: List[Dict[str, Any]] = []
+    regressions: List[Dict[str, Any]] = []
+    resolved_nonregressions: List[Dict[str, Any]] = []
+
+    for proposal in proposals:
+        target = proposal_target_key(proposal)
+        resolution = resolutions.get(target)
+        already_resolved = False
+        is_regression = False
+        if resolution:
+            decision = resolution["decision"]
+            if decision == "fixed":
+                latest = parse_time(proposal.get("latest_evidence_at"))
+                watermark = parse_time(resolution.get("resolved_at"))
+                is_regression = bool(latest and watermark and latest > watermark)
+                already_resolved = not is_regression
+            else:
+                already_resolved = True
+
+            proposal["resolution"] = dict(resolution)
+            if is_regression:
+                pr = resolution.get("pr") or "recorded fix"
+                marker = f"Regression after {pr} (fixed {resolution['resolved_at']})"
+                proposal["summary"] = f"{proposal['summary']} {marker}."
+                proposal["regression"] = {
+                    "target": target,
+                    "pr": resolution.get("pr", ""),
+                    "fixed_at": resolution["resolved_at"],
+                    "latest_evidence_at": proposal["latest_evidence_at"],
+                }
+                regressions.append(proposal)
+            elif already_resolved:
+                resolved_nonregressions.append(proposal)
+                if not include_resolved:
+                    suppressed.append(
+                        {
+                            "proposal_id": proposal["proposal_id"],
+                            "target": target,
+                            "decision": decision,
+                            "resolved_at": resolution["resolved_at"],
+                            "pr": resolution.get("pr", ""),
+                        }
+                    )
+                    continue
+                proposal["included_resolved"] = True
+
+        if not include_seen and proposal.get("proposal_key") in seen:
+            continue
+        emitted.append(proposal)
+
+    return ProposalFilterResult(emitted, suppressed, regressions, resolved_nonregressions)
 
 
 def compute_since(args: argparse.Namespace, state: Dict[str, Any]) -> Optional[dt.datetime]:
@@ -2282,6 +2595,11 @@ def scan(args: argparse.Namespace) -> int:
     config_path = Path(getattr(args, "config", "") or DEFAULT_CONFIG_PATH).expanduser()
     apply_config(load_config(config_path))
     state = load_state(root)
+    try:
+        resolutions = load_resolutions(root)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     since = compute_since(args, state)
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -2311,8 +2629,20 @@ def scan(args: argparse.Namespace) -> int:
     pp_root_arg = getattr(args, "printing_press_root", None)
     pp_root = Path(pp_root_arg).expanduser() if pp_root_arg else None
     detected = generate_proposals(sessions, pp_root, route=args.route)
-    annotate_recurrence(detected, state)
-    proposals = filter_new_proposals(detected, state, args.include_seen)
+    annotate_recurrence(detected, state, resolutions)
+    filtered = filter_new_proposals(
+        detected,
+        state,
+        args.include_seen,
+        resolutions,
+        args.include_resolved,
+    )
+    proposals = filtered.proposals
+    suppressed_targets = sorted({item["target"] for item in filtered.suppressed})
+    regression_rows = [
+        {"proposal_id": proposal["proposal_id"], **proposal["regression"]}
+        for proposal in filtered.regressions
+    ]
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -2323,6 +2653,10 @@ def scan(args: argparse.Namespace) -> int:
         "files_scanned": len(files),
         "sessions_with_signals": len(sessions),
         "proposal_count": len(proposals),
+        "resolved_suppressed_count": len(filtered.suppressed),
+        "resolved_suppressed_targets": suppressed_targets,
+        "regression_count": len(filtered.regressions),
+        "regressions": regression_rows,
         "parse_stats": parse_stats,
         "parser_warnings": parser_warnings,
         "output_root": str(root),
@@ -2339,9 +2673,22 @@ def scan(args: argparse.Namespace) -> int:
     for proposal in proposals:
         write_json(proposal_dir / f"{proposal['proposal_id']}.json", proposal)
 
-    packet_path = write_review_packet(root, run_id, sessions, proposals, parser_warnings)
+    packet_path = write_review_packet(
+        root,
+        run_id,
+        sessions,
+        proposals,
+        parser_warnings,
+        filtered.suppressed,
+        filtered.regressions,
+    )
     state["schema_version"] = SCHEMA_VERSION
-    update_target_history(state, detected, run_id)
+    resolved_ids = {id(proposal) for proposal in filtered.resolved_nonregressions}
+    update_target_history(
+        state,
+        [proposal for proposal in detected if id(proposal) not in resolved_ids],
+        run_id,
+    )
     state["last_scan_started_at"] = result["started_at"]
     state["last_run_id"] = run_id
     seen = set(state.get("seen_proposal_keys") or [])
@@ -2351,10 +2698,55 @@ def scan(args: argparse.Namespace) -> int:
     write_json(root / "runs" / f"{run_id}.json", {**result, "review_packet": str(packet_path)})
 
     print(f"scanned={len(files)} sessions_with_signals={len(sessions)} proposals={len(proposals)}")
+    print(
+        f"resolved_suppressed={len(filtered.suppressed)} "
+        f"targets={','.join(suppressed_targets) or '-'} regressions={len(filtered.regressions)}"
+    )
     print(f"review_packet={packet_path}")
     if proposals:
         print(f"proposal_dir={proposal_dir}")
     return 0
+
+
+def manage_resolutions(args: argparse.Namespace) -> int:
+    root = Path(args.output_root).expanduser()
+    actor = str(args.by or os.environ.get("USER") or "unknown")
+    try:
+        if args.list_resolutions:
+            print(json.dumps(load_resolutions(root), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        if args.unresolve:
+            remove_resolution(root, args.unresolve)
+            print(f"unresolved={validate_resolution_target(args.unresolve)}")
+            return 0
+        if args.resolve_from:
+            updates = load_decision_import(Path(args.resolve_from).expanduser(), actor)
+            update_resolutions(root, updates)
+            print(f"resolutions_imported={len(updates)} targets={','.join(sorted(updates))}")
+            return 0
+        if args.resolve:
+            if not args.decision:
+                raise ValueError("--resolve requires --decision")
+            resolved_at = args.resolved_at or utc_now()
+            target = validate_resolution_target(args.resolve)
+            update_resolutions(
+                root,
+                {
+                    target: {
+                        "decision": args.decision,
+                        "resolved_at": resolved_at,
+                        "pr": args.pr or "",
+                        "note": args.note or "",
+                        "by": actor,
+                    }
+                },
+            )
+            print(f"resolved={target} decision={args.decision}")
+            return 0
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return scan(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2380,6 +2772,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--since-days", type=float, default=None, help="Scan sessions modified within N days")
     parser.add_argument("--max-sessions", type=int, default=0, help="Limit to most recent N sessions after filtering")
     parser.add_argument("--include-seen", action="store_true", help="Emit proposals even if their keys were seen before")
+    parser.add_argument(
+        "--include-resolved",
+        action="store_true",
+        help="Debug bypass: emit already-resolved proposals (seen-key filtering still applies)",
+    )
     parser.add_argument("--full", action="store_true", help="Keep full, unredacted excerpts inline (local use only; do not share the output)")
     parser.add_argument(
         "--printing-press-root",
@@ -2397,13 +2794,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print JSON and do not write queue files")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--resolve", metavar="ROUTE:TARGET", help="Record a target resolution")
+    actions.add_argument("--resolve-from", metavar="PATH", help="Import structured decisions JSON")
+    actions.add_argument("--list-resolutions", action="store_true", help="Print the resolutions registry")
+    actions.add_argument("--unresolve", metavar="ROUTE:TARGET", help="Remove a target resolution")
+    parser.add_argument("--decision", choices=sorted(RESOLUTION_DECISIONS), help="Resolution decision")
+    parser.add_argument("--resolved-at", help="Resolution watermark (ISO8601 UTC; default now)")
+    parser.add_argument("--pr", help="Fix PR number or URL")
+    parser.add_argument("--note", help="Human-readable resolution note")
+    parser.add_argument("--by", help="Person or agent recording the resolution (default current user)")
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return scan(args)
+    return manage_resolutions(args)
 
 
 if __name__ == "__main__":

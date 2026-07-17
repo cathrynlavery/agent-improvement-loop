@@ -35,9 +35,24 @@ Every transcript reduces to tool calls, CLI invocations, skill invocations, fail
 
 Proposal IDs are deterministic from route, target, and evidence references, so daily scans avoid restaging the same item unless `--include-seen` is passed.
 
+Every proposal also carries `latest_evidence_at`, the maximum normalized event timestamp across its evidence. The normalizers preserve the transcript record timestamp on each evidence item. Formats without per-record timestamps fall back to the transcript mtime, then a date encoded in a Codex rollout filename. This watermark makes it possible to distinguish stale evidence from a post-fix regression.
+
+## Resolutions
+
+Reviewed outcomes live in a separate `~/.agent-improvement/resolutions.json`, keyed by `route:target`. Keeping this registry outside `state.json` prevents a missing or corrupt scan state from erasing completed decisions. Each entry records `decision` (`fixed`, `wontfix`, or `ignored`), `resolved_at`, `pr`, `note`, and `by`.
+
+Resolution filtering runs before seen-key filtering:
+
+- `fixed` evidence at or before `resolved_at` is suppressed.
+- `fixed` evidence after `resolved_at` is emitted and annotated as a regression after the recorded fix.
+- `wontfix` and `ignored` targets remain suppressed independent of evidence time.
+- `--include-resolved` bypasses resolution suppression for debugging; `--include-seen` alone cannot bypass it.
+
+Suppression is observable. Run metadata records suppressed counts and targets, and review packets repeat the summary and put reopened regressions in their own section. A `decisions.json` handoff lets a fix workflow batch-import `proposal_id`, `target`, `decision`, `resolved_at`, `pr`, `note`, and `by`; open or deferred proposals are omitted.
+
 ## Trends
 
-State keeps a bounded per-target history of which runs flagged each `route:target`. Proposals whose target already appeared in previous runs are annotated as recurring and sorted to the top of the packet. Recurrence counts runs, not evidence lines, so fresh evidence for an old problem reads as "still broken", not "new problem". Dry runs read the history but never write it.
+State keeps a bounded per-target history of which runs flagged each `route:target`. Proposals whose target already appeared in previous runs are annotated as recurring and sorted to the top of the packet. Recurrence counts runs, not evidence lines, so fresh evidence for an old problem reads as "still broken", not "new problem". Recording a resolution trims runs at or before `resolved_at`; resolved stale evidence does not add history, so a later regression begins a new recurrence era. Dry runs read the history but never write it.
 
 ## Self-checks
 
@@ -60,4 +75,4 @@ Detector knobs live in an optional JSON config (`~/.agent-improvement/config.jso
 
 ## Reviewer contract
 
-A review turn reads the latest packet and produces one decision per proposal (apply / defer / reject / route onward), shows the exact diff or command first, and applies only after explicit approval.
+A review turn reads the latest packet and produces one decision per proposal (apply / defer / reject / route onward), shows the exact diff or command first, and applies only after explicit approval. After approved work is completed, it emits a structured `decisions.json`: completed fixes become `fixed`, intentional durable non-fixes become `wontfix`, and stale/false-positive/one-off signals become `ignored`. Deferred and open proposals are not resolved.

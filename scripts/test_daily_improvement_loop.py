@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import datetime as dt
+import io
 import json
+import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1336,8 +1340,13 @@ class CurrentTranscriptFormatTests(unittest.TestCase):
             summary = loop.parse_codex_session(path)
             self.assertEqual(sorted(summary.pp_cli_invocations), ["stripe-pp-cli"])
             self.assertEqual(len(summary.failures), 1)
+            self.assertEqual(summary.failures[0].occurred_at, "2026-07-15T00:00:02+00:00")
             kinds = {ev.kind for ev in summary.pp_cli_invocations["stripe-pp-cli"]}
             self.assertIn("tool_failure", kinds)
+            proposal = next(
+                p for p in loop.generate_proposals([summary]) if p["route"] == "tool"
+            )
+            self.assertEqual(proposal["latest_evidence_at"], "2026-07-15T00:00:02+00:00")
 
     def test_code_literal_escaped_newline_does_not_fabricate_cli_name(self):
         # Redacted from the exact `|| true\ncloudflare-pp-cli` shape that
@@ -1875,6 +1884,297 @@ class RecurrenceTests(unittest.TestCase):
         self.assertEqual(len(runs), loop.TARGET_HISTORY_KEEP)
         self.assertEqual(runs[-1], "run11")
         self.assertEqual(runs[0], "run2")
+
+
+class ResolutionTests(unittest.TestCase):
+    @staticmethod
+    def _proposal(target, occurred_at, route="tool", line=1):
+        ev = loop.Evidence(
+            source="codex",
+            path=f"/tmp/rollout-{occurred_at[:10]}T00-00-00.jsonl",
+            line=line,
+            kind="tool_failure",
+            excerpt="failed",
+            occurred_at=occurred_at,
+        )
+        return loop.make_proposal(
+            route=route,
+            title=f"Review {target}",
+            summary=f"{target}: friction.",
+            target_kind="tool",
+            target_name=target,
+            evidence_items=[ev],
+            suggested_action="review",
+            impact=["safer"],
+        )
+
+    @staticmethod
+    def _resolution(decision, resolved_at="2026-07-15T12:00:00Z", pr="71"):
+        return loop.normalize_resolution(
+            {
+                "decision": decision,
+                "resolved_at": resolved_at,
+                "pr": pr,
+                "note": "reviewed",
+                "by": "tester",
+            }
+        )
+
+    def test_fixed_resolution_suppresses_old_evidence_and_reopens_regression(self):
+        old = self._proposal("cloudflare-pp-cli", "2026-07-15T11:59:59Z", line=1)
+        new = self._proposal("cloudflare-pp-cli", "2026-07-15T12:00:01Z", line=2)
+        result = loop.filter_new_proposals(
+            [old, new],
+            {},
+            include_seen=False,
+            resolutions={"tool:cloudflare-pp-cli": self._resolution("fixed")},
+        )
+
+        self.assertEqual(result.proposals, [new])
+        self.assertEqual(len(result.suppressed), 1)
+        self.assertEqual(result.suppressed[0]["target"], "tool:cloudflare-pp-cli")
+        self.assertEqual(result.regressions, [new])
+        self.assertIn("Regression after 71 (fixed 2026-07-15T12:00:00+00:00)", new["summary"])
+        self.assertEqual(old["latest_evidence_at"], "2026-07-15T11:59:59+00:00")
+
+    def test_evidence_time_falls_back_to_file_mtime_then_rollout_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "legacy.jsonl"
+            path.write_text("{}\n", encoding="utf-8")
+            expected = dt.datetime(2026, 7, 14, 8, 9, 10, tzinfo=dt.timezone.utc)
+            os.utime(path, (expected.timestamp(), expected.timestamp()))
+            from_mtime = loop.Evidence(
+                source="claude",
+                path=str(path),
+                line=1,
+                kind="tool_failure",
+                excerpt="failed",
+            )
+            self.assertEqual(loop.evidence_time(from_mtime), expected)
+
+        from_name = loop.Evidence(
+            source="codex",
+            path="/missing/rollout-2026-07-13T07-08-09-example.jsonl",
+            line=1,
+            kind="tool_failure",
+            excerpt="failed",
+        )
+        self.assertEqual(
+            loop.evidence_time(from_name),
+            dt.datetime(2026, 7, 13, 7, 8, 9, tzinfo=dt.timezone.utc),
+        )
+
+    def test_wontfix_and_ignored_always_suppress_and_include_resolved_bypasses(self):
+        wontfix = self._proposal("shopify-pp-cli", "2026-07-16T00:00:00Z", line=1)
+        ignored = self._proposal("truencloudflare-pp-cli", "2026-07-16T00:00:00Z", line=2)
+        resolutions = {
+            "tool:shopify-pp-cli": self._resolution("wontfix"),
+            "tool:truencloudflare-pp-cli": self._resolution("ignored"),
+        }
+
+        normal = loop.filter_new_proposals(
+            [wontfix, ignored], {}, include_seen=True, resolutions=resolutions
+        )
+        debug = loop.filter_new_proposals(
+            [wontfix, ignored],
+            {},
+            include_seen=True,
+            resolutions=resolutions,
+            include_resolved=True,
+        )
+
+        self.assertEqual(normal.proposals, [])
+        self.assertEqual(len(normal.suppressed), 2)
+        self.assertEqual(debug.proposals, [wontfix, ignored])
+        self.assertTrue(all(p["included_resolved"] for p in debug.proposals))
+
+    def test_include_seen_does_not_bypass_resolution(self):
+        proposal = self._proposal("linq-pp-cli", "2026-07-14T00:00:00Z")
+        result = loop.filter_new_proposals(
+            [proposal],
+            {"seen_proposal_keys": [proposal["proposal_key"]]},
+            include_seen=True,
+            resolutions={"tool:linq-pp-cli": self._resolution("fixed")},
+        )
+        self.assertEqual(result.proposals, [])
+        self.assertEqual(len(result.suppressed), 1)
+
+    def test_recurrence_counts_only_runs_after_resolution(self):
+        proposal = self._proposal("cloud-run-admin-pp-cli", "2026-07-17T00:00:00Z")
+        state = {
+            "target_run_history": {
+                "tool:cloud-run-admin-pp-cli": [
+                    "20260714T120000Z",
+                    "20260715T120000Z",
+                    "20260716T120000Z",
+                ]
+            }
+        }
+        resolutions = {
+            "tool:cloud-run-admin-pp-cli": self._resolution(
+                "fixed", resolved_at="2026-07-15T12:00:00Z", pr="62"
+            )
+        }
+
+        loop.annotate_recurrence([proposal], state, resolutions)
+
+        self.assertEqual(proposal["recurrence"], 2)
+        self.assertIn("1 previous run(s)", proposal["summary"])
+
+    def test_resolve_list_unresolve_and_resolve_from_round_trip(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "queue"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    loop.main(
+                        [
+                            "--output-root",
+                            str(root),
+                            "--resolve",
+                            "tool:cloudflare-pp-cli",
+                            "--decision",
+                            "fixed",
+                            "--resolved-at",
+                            "2026-07-15T12:00:00Z",
+                            "--pr",
+                            "71",
+                            "--note",
+                            "merged",
+                            "--by",
+                            "cat",
+                        ]
+                    ),
+                    0,
+                )
+            decisions = Path(td) / "decisions.json"
+            loop.write_json(
+                decisions,
+                {
+                    "schema_version": 1,
+                    "decisions": [
+                        {
+                            "proposal_id": "imp-example",
+                            "target": "tool:shopify-pp-cli",
+                            "decision": "ignored",
+                            "resolved_at": "2026-07-16T00:00:00Z",
+                            "pr": "",
+                            "note": "detector false positive",
+                        }
+                    ],
+                },
+            )
+            with redirect_stdout(output):
+                self.assertEqual(
+                    loop.main(
+                        [
+                            "--output-root",
+                            str(root),
+                            "--resolve-from",
+                            str(decisions),
+                            "--by",
+                            "reviewer",
+                        ]
+                    ),
+                    0,
+                )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    loop.main(["--output-root", str(root), "--list-resolutions"]), 0
+                )
+            listed = json.loads(output.getvalue())
+            self.assertEqual(listed["tool:cloudflare-pp-cli"]["pr"], "71")
+            self.assertEqual(listed["tool:shopify-pp-cli"]["decision"], "ignored")
+            self.assertEqual(listed["tool:shopify-pp-cli"]["by"], "reviewer")
+
+            with redirect_stdout(output):
+                self.assertEqual(
+                    loop.main(
+                        [
+                            "--output-root",
+                            str(root),
+                            "--unresolve",
+                            "tool:cloudflare-pp-cli",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertNotIn("tool:cloudflare-pp-cli", loop.load_resolutions(root))
+
+    def test_resolve_defaults_watermark_to_now(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            before = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    loop.main(
+                        [
+                            "--output-root",
+                            str(root),
+                            "--resolve",
+                            "tool:linq-pp-cli",
+                            "--decision",
+                            "fixed",
+                        ]
+                    ),
+                    0,
+                )
+            after = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            recorded = loop.parse_time(
+                loop.load_resolutions(root)["tool:linq-pp-cli"]["resolved_at"]
+            )
+            self.assertIsNotNone(recorded)
+            self.assertGreaterEqual(recorded, before)
+            self.assertLessEqual(recorded, after)
+
+    def test_resolutions_survive_corrupt_and_empty_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.mkdir(exist_ok=True)
+            (root / "state.json").write_text("{broken", encoding="utf-8")
+            loop.update_resolutions(
+                root,
+                {"tool:linq-pp-cli": self._resolution("fixed", pr="68")},
+            )
+            self.assertEqual(loop.load_state(root)["seen_proposal_keys"], [])
+            self.assertEqual(loop.load_resolutions(root)["tool:linq-pp-cli"]["pr"], "68")
+
+            loop.write_json(root / "state.json", {})
+            loop.update_resolutions(
+                root,
+                {"tool:shopify-pp-cli": self._resolution("ignored", pr="")},
+            )
+            self.assertEqual(set(loop.load_resolutions(root)), {
+                "tool:linq-pp-cli",
+                "tool:shopify-pp-cli",
+            })
+
+    def test_review_packet_reports_suppression_and_regressions(self):
+        old = self._proposal("cloudflare-pp-cli", "2026-07-15T00:00:00Z", line=1)
+        proposal = self._proposal("cloudflare-pp-cli", "2026-07-16T00:00:00Z", line=2)
+        resolution = self._resolution("fixed")
+        filtered = loop.filter_new_proposals(
+            [old, proposal],
+            {},
+            include_seen=False,
+            resolutions={"tool:cloudflare-pp-cli": resolution},
+        )
+        with tempfile.TemporaryDirectory() as td:
+            packet = loop.write_review_packet(
+                Path(td),
+                "20260717T000000Z",
+                [],
+                filtered.proposals,
+                resolution_suppressed=filtered.suppressed,
+                regressions=filtered.regressions,
+            ).read_text(encoding="utf-8")
+
+        self.assertIn("1 proposals suppressed as already-resolved", packet)
+        self.assertIn("Regressions re-opened after a fix: 1", packet)
+        self.assertIn("## Regressions re-opened after a fix", packet)
+        self.assertIn("tool:cloudflare-pp-cli", packet)
 
 
 if __name__ == "__main__":
