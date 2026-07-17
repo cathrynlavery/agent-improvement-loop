@@ -125,6 +125,66 @@ HANG_RE = re.compile(
     r"killed|sigterm|sigkill"
     r")"
 )
+# A result must be exactly empty after removing a known runner envelope. Do not
+# search for these strings inside larger output: a response that merely contains
+# an empty object or "0 rows" is not itself empty.
+SILENT_EMPTY_RE = re.compile(
+    r"(?is)^(?:\[\]|\{\}|null|no results[.!]?|\(?\s*0 rows?\s*\)?|\(empty\))$"
+)
+SILENT_EMPTY_RUNNER_RE = re.compile(
+    r"(?is)^script completed\s*\nwall time[^\n]*\noutput:\s*\n?"
+)
+SILENT_EMPTY_EXIT_RUNNER_RE = re.compile(
+    r"(?is)^process exited with code\s+0\s*\n(?:final )?output:\s*\n?"
+)
+SILENT_EMPTY_ACK_RE = re.compile(
+    r"(?i)\b("
+    r"no (?:(?:existing|matching) )?(?:results?|matches?|records?|rows?|items?|data|entries|"
+    r"pull requests?|prs?|logs?|threads?)|"
+    r"(?:returned|found|got|shows?) (?:no|zero) (?:results?|matches?|records?|rows?|"
+    r"items?|data|entries|pull requests?|prs?|logs?|threads?)|"
+    r"empty (?:result|response|list|object|output)|nothing (?:matched|returned|found)"
+    r")\b"
+)
+# Generic data-returning command shapes. Tracked CLIs and MCP calls qualify
+# separately; these signatures cover common shell/API query paths without
+# treating every command with no stdout as a failed fetch.
+SILENT_EMPTY_FETCH_VERBS = {"fetch", "get", "list", "query", "read", "search", "show"}
+SILENT_EMPTY_MUTATION_VERBS = {
+    "create",
+    "delete",
+    "deploy",
+    "edit",
+    "insert",
+    "mkdir",
+    "post",
+    "publish",
+    "put",
+    "remove",
+    "rm",
+    "send",
+    "set",
+    "touch",
+    "update",
+    "upload",
+    "write",
+}
+SILENT_EMPTY_IGNORE_EXECUTABLES = {
+    "[",
+    "chmod",
+    "cp",
+    "echo",
+    "grep",
+    "mkdir",
+    "mv",
+    "printf",
+    "rg",
+    "rm",
+    "tee",
+    "test",
+    "touch",
+}
+DETECT_SILENT_EMPTY = True
 # A *-pp-cli invoked at least this many times in a single session can be
 # retry-before-success friction when corroborated by failure/hang evidence or
 # same-subcommand flag variation.
@@ -406,6 +466,7 @@ class SessionSummary:
     skill_invocations: Dict[str, List[Evidence]] = field(default_factory=dict)
     slash_commands: Dict[str, List[Evidence]] = field(default_factory=dict)
     failures: List[Evidence] = field(default_factory=list)
+    silent_empty: List[Evidence] = field(default_factory=list)
     corrections: List[Evidence] = field(default_factory=list)
 
     def has_signal(self) -> bool:
@@ -413,6 +474,7 @@ class SessionSummary:
             self.pp_cli_invocations
             or self.skill_invocations
             or self.failures
+            or self.silent_empty
             or self.corrections
             or self.slash_commands
         )
@@ -430,6 +492,7 @@ class SessionSummary:
             "skill_names": sorted(self.skill_invocations),
             "slash_commands": sorted(self.slash_commands),
             "failure_count": len(self.failures),
+            "silent_empty_count": len(self.silent_empty),
             "correction_count": len(self.corrections),
         }
 
@@ -895,6 +958,172 @@ def tool_result_is_failure(
     return is_failure_text(text, call.command if call else "", call.clis if call else None)
 
 
+def codex_tool_output_text(value: Any) -> str:
+    """Flatten current Codex output blocks while preserving plain strings."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") in {
+                "input_text",
+                "output_text",
+                "text",
+            }:
+                parts.append(str(item.get("text") or ""))
+        return "".join(parts)
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("output") or "")
+    return "" if value is None else str(value)
+
+
+def silent_empty_payload(output: str) -> Optional[str]:
+    """Return the normalized empty payload, or None for non-empty output."""
+    payload = output or ""
+    payload = SILENT_EMPTY_RUNNER_RE.sub("", payload, count=1)
+    payload = SILENT_EMPTY_EXIT_RUNNER_RE.sub("", payload, count=1)
+    payload = payload.strip()
+    if not payload:
+        return "(empty stdout)"
+    return payload if SILENT_EMPTY_RE.fullmatch(payload) else None
+
+
+def silent_empty_command(call: ToolCall) -> str:
+    """Return one attributable shell command, rejecting runtime ambiguity."""
+    command = call.command or ""
+    if not CODE_COMMAND_RE.match(command):
+        return command
+    commands = [
+        match.group(2).replace(r"\n", "\n").replace(r"\t", "\t")
+        for match in CODE_SHELL_STRING_RE.finditer(command)
+    ]
+    return commands[0] if len(commands) == 1 else ""
+
+
+def command_intends_data(call: ToolCall, command: str) -> bool:
+    """Conservatively classify calls whose successful result should carry data."""
+    if call.name.startswith("mcp__"):
+        tool_words = set(call.name.rsplit("__", 1)[-1].lower().split("_"))
+        return not bool(tool_words & SILENT_EMPTY_MUTATION_VERBS)
+    if not command:
+        return False
+    tokens = shell_tokens(command)
+    if not tokens:
+        return False
+    if any(token in {";", "&&", "||"} for token in tokens):
+        return False
+    executable = first_executable(command)
+    if executable in SILENT_EMPTY_IGNORE_EXECUTABLES:
+        return False
+    if any(token in {"-q", "--quiet"} for token in tokens):
+        return False
+    command_words = {
+        token.lower().split()[0]
+        for token in tokens[1:4]
+        if not token.startswith("-") and token.strip()
+    }
+    if command_words & SILENT_EMPTY_MUTATION_VERBS:
+        return False
+    for index, token in enumerate(tokens):
+        if token in {"-X", "--request", "--method"} and index + 1 < len(tokens):
+            if tokens[index + 1].lower() in SILENT_EMPTY_MUTATION_VERBS:
+                return False
+        if token.startswith(("--request=", "--method=")):
+            if token.split("=", 1)[1].lower() in SILENT_EMPTY_MUTATION_VERBS:
+                return False
+    if re.search(r"(?:^|\s)(?:>|>>)\s*[^&]", command):
+        return False
+    if executable == "curl" and any(
+        token in {"-d", "--data", "--data-raw", "--data-binary", "-o", "--output"}
+        or token.startswith("--data=")
+        or token.startswith("--output=")
+        for token in tokens
+    ):
+        return False
+    if call.clis:
+        return True
+    if "--json" in tokens:
+        return True
+    for index, token in enumerate(tokens):
+        if token == "--format" and index + 1 < len(tokens) and tokens[index + 1].lower() == "json":
+            return True
+        if token.lower() == "--format=json":
+            return True
+    if executable == "curl":
+        return True
+    if executable == "gh" and "api" in tokens[1:3]:
+        return True
+    if executable == "bq" and "query" in tokens[1:]:
+        return True
+    if executable == "psql" and any(token in {"-c", "--command"} for token in tokens):
+        return True
+    return executable.lower() in SILENT_EMPTY_FETCH_VERBS or any(
+        token.lower() in SILENT_EMPTY_FETCH_VERBS for token in tokens[1:3]
+    )
+
+
+def silent_empty_evidence(
+    summary: SessionSummary,
+    source: str,
+    path: Path,
+    line_no: int,
+    call: Optional[ToolCall],
+    output: str,
+    is_error: Optional[bool],
+    occurred_at: Any,
+) -> Optional[Evidence]:
+    """Build high-confidence evidence for a swallowed, successful empty result."""
+    if not DETECT_SILENT_EMPTY or not call or is_error:
+        return None
+    if len(call.clis) > 1:
+        return None
+    command = silent_empty_command(call)
+    if not command_intends_data(call, command):
+        return None
+    # This detector is intentionally stricter than hard-failure classification:
+    # any visible failure or hang phrase disqualifies the silent-empty signal.
+    if BAD_EXIT_RE.search(output) or FAILURE_RE.search(output) or HANG_RE.search(output):
+        return None
+    payload = silent_empty_payload(output)
+    if payload is None:
+        return None
+    return evidence(
+        source=source,
+        path=path,
+        line=line_no,
+        kind="silent_empty",
+        text=payload,
+        session_id=summary.session_id,
+        tool_name=call.name,
+        command=command,
+        occurred_at=occurred_at,
+    )
+
+
+def record_silent_empty(summary: SessionSummary, ev: Evidence, call: ToolCall) -> None:
+    summary.silent_empty.append(ev)
+    for cli in call.clis:
+        add_pp_cli_evidence(summary, cli, ev)
+
+
+def empty_result_was_swallowed(
+    result_line: int,
+    agent_step_lines: List[int],
+    agent_messages: List[Tuple[int, str]],
+) -> bool:
+    """Require a later step, unless that step explicitly acknowledges emptiness."""
+    later_steps = [line for line in agent_step_lines if line > result_line]
+    if not later_steps:
+        return False
+    next_step = min(later_steps)
+    return not any(
+        line == next_step and SILENT_EMPTY_ACK_RE.search(text)
+        for line, text in agent_messages
+    )
+
+
 def pp_cli_failures_for_output(
     command: str,
     output: str,
@@ -922,6 +1151,9 @@ def pp_cli_failures_for_output(
 def parse_claude_session(path: Path) -> SessionSummary:
     summary = SessionSummary(source="claude", path=path, session_id=path.stem)
     calls: Dict[str, ToolCall] = {}
+    silent_candidates: List[Tuple[int, ToolCall, str, Optional[bool], Any]] = []
+    agent_step_lines: List[int] = []
+    agent_messages: List[Tuple[int, str]] = []
 
     for line_no, rec in jsonl_records(path):
         session_id = str(rec.get("sessionId") or summary.session_id)
@@ -935,6 +1167,12 @@ def parse_claude_session(path: Path) -> SessionSummary:
         msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
         role = msg.get("role") or rec.get("type")
         content = msg.get("content")
+
+        if role == "assistant" and content:
+            agent_step_lines.append(line_no)
+            assistant_text = text_from_claude_content(content)
+            if assistant_text:
+                agent_messages.append((line_no, assistant_text))
 
         if role == "user":
             text = text_from_claude_content(content)
@@ -1061,6 +1299,25 @@ def parse_claude_session(path: Path) -> SessionSummary:
                             ts,
                         )
 
+                    if call:
+                        silent_candidates.append(
+                            (
+                                line_no,
+                                call,
+                                result_text,
+                                is_err if isinstance(is_err, bool) else None,
+                                ts,
+                            )
+                        )
+
+    for line_no, call, output, is_err, ts in silent_candidates:
+        if not empty_result_was_swallowed(line_no, agent_step_lines, agent_messages):
+            continue
+        ev = silent_empty_evidence(
+            summary, "claude", path, line_no, call, output, is_err, ts
+        )
+        if ev:
+            record_silent_empty(summary, ev, call)
     return summary
 
 
@@ -1102,6 +1359,9 @@ def codex_message_text(payload: Dict[str, Any]) -> str:
 def parse_codex_session(path: Path) -> SessionSummary:
     summary = SessionSummary(source="codex", path=path, session_id=path.stem)
     calls: Dict[str, ToolCall] = {}
+    silent_candidates: List[Tuple[int, ToolCall, str, Optional[bool], Any]] = []
+    agent_step_lines: List[int] = []
+    agent_messages: List[Tuple[int, str]] = []
 
     for line_no, rec in jsonl_records(path):
         payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
@@ -1144,7 +1404,19 @@ def parse_codex_session(path: Path) -> SessionSummary:
                 )
 
         payload_type = payload.get("type")
+        if payload_type == "agent_message" or (
+            payload_type == "message" and payload.get("role") == "assistant"
+        ):
+            agent_step_lines.append(line_no)
+            agent_text = (
+                str(payload.get("message") or "")
+                if payload_type == "agent_message"
+                else codex_message_text(payload)
+            )
+            if agent_text:
+                agent_messages.append((line_no, agent_text))
         if payload_type in {"function_call", "custom_tool_call"}:
+            agent_step_lines.append(line_no)
             name = str(payload.get("name") or "")
             call_id = str(payload.get("call_id") or f"{path}:{line_no}:{len(calls)}")
             if payload_type == "custom_tool_call":
@@ -1192,8 +1464,10 @@ def parse_codex_session(path: Path) -> SessionSummary:
         elif payload_type in {"function_call_output", "custom_tool_call_output"}:
             call_id = str(payload.get("call_id") or "")
             call = calls.get(call_id)
-            output = str(payload.get("output") or "")
-            if call and output and tool_result_is_failure(call, output):
+            output = codex_tool_output_text(payload.get("output"))
+            is_err = payload.get("is_error")
+            status = is_err if isinstance(is_err, bool) else None
+            if call and output and tool_result_is_failure(call, output, status):
                 ev = evidence(
                     source="codex",
                     path=path,
@@ -1215,6 +1489,15 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     summary, "codex", path, line_no, call.command, output, call.clis, ts
                 )
 
+            if call:
+                silent_candidates.append((line_no, call, output, status, ts))
+
+    for line_no, call, output, is_err, ts in silent_candidates:
+        if not empty_result_was_swallowed(line_no, agent_step_lines, agent_messages):
+            continue
+        ev = silent_empty_evidence(summary, "codex", path, line_no, call, output, is_err, ts)
+        if ev:
+            record_silent_empty(summary, ev, call)
     return summary
 
 
@@ -1806,9 +2089,13 @@ def generate_proposals(
     pp_invocations: Dict[str, List[Evidence]] = {}
     pp_failures: Dict[str, List[Evidence]] = {}
     pp_hangs: Dict[str, List[Evidence]] = {}
+    pp_silent_empty: Dict[str, List[Evidence]] = {}
     pp_max_retries: Dict[str, int] = {}
     plain_command_clis: set[str] = set()
     for session in sessions:
+        include_session_silent_empty = (
+            INCLUDE_SUBAGENT_FAILURES or "/subagents/" not in str(session.path)
+        )
         for call in session.tool_calls:
             if call.command and not CODE_COMMAND_RE.match(call.command):
                 plain_command_clis.update(pp_cli_names(call.command))
@@ -1823,6 +2110,8 @@ def generate_proposals(
                     pp_failures.setdefault(cli, []).append(item)
                 elif item.kind == "pp_cli_hang":
                     pp_hangs.setdefault(cli, []).append(item)
+                elif item.kind == "silent_empty" and include_session_silent_empty:
+                    pp_silent_empty.setdefault(cli, []).append(item)
 
             # Retry-before-success is per CLI and session. Repetition alone is
             # normal use; qualify it only when the same session has failure/hang
@@ -1832,6 +2121,7 @@ def generate_proposals(
                 item.session_id
                 for item in items
                 if item.kind in {"tool_failure", "pp_cli_hang"}
+                or (item.kind == "silent_empty" and include_session_silent_empty)
             }
             for item in invocations:
                 by_session.setdefault(item.session_id, []).append(item)
@@ -1849,6 +2139,7 @@ def generate_proposals(
         for cli in (
             set(pp_failures)
             | set(pp_hangs)
+            | set(pp_silent_empty)
             | {cli for cli, count in pp_max_retries.items() if count >= RETRY_STUCK_THRESHOLD}
         )
         if VALID_PP_CLI_RE.match(cli)
@@ -1857,10 +2148,11 @@ def generate_proposals(
     for cli in flagged_clis:
         failures = pp_failures.get(cli, [])
         hangs = pp_hangs.get(cli, [])
+        silent_empty = pp_silent_empty.get(cli, [])
         invocations = pp_invocations.get(cli, [])
         max_retries = pp_max_retries.get(cli, 0)
         stuck = max_retries >= RETRY_STUCK_THRESHOLD
-        evidence_items = (failures + hangs + invocations)[:12]
+        evidence_items = (failures + hangs + silent_empty + invocations)[:12]
         session_count = len({ev.session_id for ev in evidence_items})
 
         friction_bits: List[str] = []
@@ -1868,6 +2160,8 @@ def generate_proposals(
             friction_bits.append(f"{len(failures)} failure signal(s)")
         if hangs:
             friction_bits.append(f"{len(hangs)} hang/timeout signal(s)")
+        if silent_empty:
+            friction_bits.append(f"{len(silent_empty)} swallowed empty result(s)")
         if stuck:
             friction_bits.append(f"retried up to {max_retries}x in one session before it worked")
         summary = f"{cli}: " + ", ".join(friction_bits) + f" across {session_count} session(s)."
@@ -1974,28 +2268,54 @@ def generate_proposals(
             executable = backlog_executable(fail.command)
             if executable and not executable.endswith(TRACKED_CLI_SUFFIX):
                 repeated_failures.setdefault(executable, []).append(fail)
-    for executable, failures in sorted(repeated_failures.items()):
-        durable_failures = [f for f in failures if TOOLING_FRICTION_RE.search(f.excerpt)]
-        session_count = len({f.session_id for f in durable_failures})
-        if len(durable_failures) < 3 or session_count < 2:
+    silent_empty_by_executable: Dict[str, List[Evidence]] = {}
+    for session in sessions:
+        if not INCLUDE_SUBAGENT_FAILURES and "/subagents/" in str(session.path):
             continue
+        for empty in session.silent_empty:
+            if empty.tool_name.startswith("mcp__"):
+                continue
+            executable = backlog_executable(empty.command)
+            if executable and not executable.endswith(TRACKED_CLI_SUFFIX):
+                silent_empty_by_executable.setdefault(executable, []).append(empty)
+    for executable in sorted(set(repeated_failures) | set(silent_empty_by_executable)):
+        durable_failures = [
+            item
+            for item in repeated_failures.get(executable, [])
+            if TOOLING_FRICTION_RE.search(item.excerpt)
+        ]
+        empties = silent_empty_by_executable.get(executable, [])
+        failure_sessions = len({item.session_id for item in durable_failures})
+        empty_sessions = len({item.session_id for item in empties})
+        if not (
+            (len(durable_failures) >= 3 and failure_sessions >= 2)
+            or (len(empties) >= 3 and empty_sessions >= 2)
+        ):
+            continue
+        all_items = durable_failures + empties
+        session_count = len({item.session_id for item in all_items})
+        signal_bits = []
+        if durable_failures:
+            signal_bits.append(f"{len(durable_failures)} command-interface failure(s)")
+        if empties:
+            signal_bits.append(f"{len(empties)} swallowed empty result(s)")
         proposals.append(
             make_proposal(
                 route="backlog",
-                title=f"Investigate repeated {executable} command failures",
+                title=f"Investigate repeated {executable} command friction",
                 summary=(
-                    f"{executable} had {len(durable_failures)} command-interface friction "
-                    f"signal(s) across "
+                    f"{executable} had {', '.join(signal_bits)} across "
                     f"{session_count} session(s)."
                 ),
                 target_kind="tooling",
                 target_name=executable,
-                evidence_items=durable_failures[:12],
+                evidence_items=all_items[:12],
                 suggested_action=(
                     "Decide whether this is a durable tooling/runbook gap or a transient "
-                    "environment issue. If durable, stage a backlog note or runbook patch."
+                    "environment issue. For unexpected empty data, add a clear empty-result "
+                    "error or contract check instead of consuming it."
                 ),
-                impact=["shorter", "safer"],
+                impact=["shorter", "safer", "more_correct"],
             )
         )
 
@@ -2003,6 +2323,7 @@ def generate_proposals(
     # expired auth, a broken server config, or a tool contract the agent keeps
     # guessing wrong - the same "fix the tool, not the prompt" lesson as CLIs.
     mcp_failures: Dict[str, List[Evidence]] = {}
+    mcp_silent_empty: Dict[str, List[Evidence]] = {}
     for session in sessions:
         if not INCLUDE_SUBAGENT_FAILURES and "/subagents/" in str(session.path):
             continue
@@ -2012,28 +2333,42 @@ def generate_proposals(
             parts = fail.tool_name.split("__")
             server = parts[1] if len(parts) > 1 and parts[1] else fail.tool_name
             mcp_failures.setdefault(server, []).append(fail)
-    for server, failures in sorted(mcp_failures.items()):
-        session_count = len({f.session_id for f in failures})
-        if len(failures) < 3 or session_count < 2:
+        for empty in session.silent_empty:
+            if not empty.tool_name.startswith("mcp__"):
+                continue
+            parts = empty.tool_name.split("__")
+            server = parts[1] if len(parts) > 1 and parts[1] else empty.tool_name
+            mcp_silent_empty.setdefault(server, []).append(empty)
+    for server in sorted(set(mcp_failures) | set(mcp_silent_empty)):
+        failures = mcp_failures.get(server, [])
+        empties = mcp_silent_empty.get(server, [])
+        all_items = failures + empties
+        session_count = len({item.session_id for item in all_items})
+        if len(all_items) < 3 or session_count < 2:
             continue
-        tools = sorted({f.tool_name for f in failures})
+        tools = sorted({item.tool_name for item in all_items})
         shown = ", ".join(tools[:4]) + ("..." if len(tools) > 4 else "")
+        signal_bits = []
+        if failures:
+            signal_bits.append(f"{len(failures)} failed tool call(s)")
+        if empties:
+            signal_bits.append(f"{len(empties)} swallowed empty result(s)")
         proposals.append(
             make_proposal(
                 route="tool",
-                title=f"Review mcp:{server} tool failures from real use",
+                title=f"Review mcp:{server} friction from real use",
                 summary=(
-                    f"MCP server {server}: {len(failures)} failed tool call(s) across "
+                    f"MCP server {server}: {', '.join(signal_bits)} across "
                     f"{session_count} session(s) ({shown})."
                 ),
                 target_kind="mcp_server",
                 target_name=f"mcp:{server}",
-                evidence_items=failures[:12],
+                evidence_items=all_items[:12],
                 suggested_action=(
-                    "Review the failed calls. Recurring MCP failures usually mean expired "
-                    "auth, a broken server config, or a tool schema the agent keeps "
-                    "guessing wrong. Fix the server setup or its tool contract instead of "
-                    "prompting around it."
+                    "Review the failed or empty calls. Recurring MCP friction usually means "
+                    "expired auth, a broken server config, a swallowed empty response, or a "
+                    "tool schema the agent keeps guessing wrong. Fix the server setup or its "
+                    "tool contract instead of prompting around it."
                 ),
                 impact=["shorter", "safer", "more_correct"],
             )
@@ -2115,10 +2450,11 @@ def apply_config(cfg: Dict[str, Any]) -> None:
     Recognized keys: tracked_cli_suffix, extra_scaffold_markers,
     extra_redaction_patterns ([[regex, replacement], ...]),
     extra_backlog_ignore, extra_remote_command_wrappers,
-    include_subagent_failures, validate_pp_cli_candidates.
+    include_subagent_failures, validate_pp_cli_candidates,
+    detect_silent_empty, silent_empty_fetch_verbs, silent_empty_ignore.
     """
     global TRACKED_CLI_SUFFIX, PP_CLI_RE, VALID_PP_CLI_RE
-    global INCLUDE_SUBAGENT_FAILURES, VALIDATE_PP_CLI_CANDIDATES
+    global INCLUDE_SUBAGENT_FAILURES, VALIDATE_PP_CLI_CANDIDATES, DETECT_SILENT_EMPTY
     suffix = cfg.get("tracked_cli_suffix")
     if isinstance(suffix, str) and suffix:
         TRACKED_CLI_SUFFIX = suffix
@@ -2145,6 +2481,14 @@ def apply_config(cfg: Dict[str, Any]) -> None:
         INCLUDE_SUBAGENT_FAILURES = cfg["include_subagent_failures"]
     if isinstance(cfg.get("validate_pp_cli_candidates"), bool):
         VALIDATE_PP_CLI_CANDIDATES = cfg["validate_pp_cli_candidates"]
+    if isinstance(cfg.get("detect_silent_empty"), bool):
+        DETECT_SILENT_EMPTY = cfg["detect_silent_empty"]
+    fetch_verbs = cfg.get("silent_empty_fetch_verbs")
+    if isinstance(fetch_verbs, list):
+        SILENT_EMPTY_FETCH_VERBS.update(str(x).lower() for x in fetch_verbs if x)
+    silent_ignore = cfg.get("silent_empty_ignore")
+    if isinstance(silent_ignore, list):
+        SILENT_EMPTY_IGNORE_EXECUTABLES.update(str(x) for x in silent_ignore if x)
 
 
 def parser_health_warnings(stats: Dict[str, Dict[str, int]]) -> List[str]:
@@ -2790,7 +3134,8 @@ def build_parser() -> argparse.ArgumentParser:
             "JSON config overriding detector defaults (tracked_cli_suffix, "
             "extra_scaffold_markers, extra_redaction_patterns, extra_backlog_ignore, "
             "extra_remote_command_wrappers, include_subagent_failures, "
-            "validate_pp_cli_candidates)"
+            "validate_pp_cli_candidates, detect_silent_empty, "
+            "silent_empty_fetch_verbs, silent_empty_ignore)"
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print JSON and do not write queue files")

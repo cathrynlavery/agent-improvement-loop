@@ -1571,6 +1571,252 @@ class ProposalNoiseTests(unittest.TestCase):
             proposals = loop.generate_proposals([summary])
             self.assertEqual([p for p in proposals if p["route"] == "tool"], [])
 
+    def test_tracked_cli_silent_empty_then_continuation_is_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "tracked-empty.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "assistant",
+                        "sessionId": "empty-cli",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "fetch",
+                                    "name": "Bash",
+                                    "input": {"command": "orders-pp-cli orders list --json"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "empty-cli",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "fetch",
+                                    "is_error": False,
+                                    "content": "{}",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "sessionId": "empty-cli",
+                        "message": {"role": "assistant", "content": "Using that result next."},
+                    },
+                ],
+            )
+
+            summary = loop.parse_claude_session(path)
+            proposals = loop.generate_proposals([summary])
+
+            self.assertEqual(len(summary.silent_empty), 1)
+            self.assertEqual(summary.silent_empty[0].kind, "silent_empty")
+            tool = [p for p in proposals if p["target"]["name"] == "orders-pp-cli"]
+            self.assertEqual(len(tool), 1)
+            self.assertIn("1 swallowed empty result(s)", tool[0]["summary"])
+
+    def test_silent_empty_payload_shapes_are_exact(self):
+        for value in ("[]", "{}", "null", "", "0 rows", "No results", "(empty)"):
+            with self.subTest(value=value):
+                self.assertIsNotNone(loop.silent_empty_payload(value))
+        self.assertIsNone(loop.silent_empty_payload('{"rows": []}'))
+        self.assertIsNone(loop.silent_empty_payload("No results for query, retrying"))
+
+    def test_json_fetch_silent_empty_routes_to_backlog(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "json-empty.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": "fetch",
+                            "arguments": json.dumps({"cmd": "widgetctl records --json"}),
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "fetch",
+                            "output": [
+                                {
+                                    "type": "input_text",
+                                    "text": "Script completed\nWall time 0.1 seconds\nOutput:\n",
+                                },
+                                {"type": "input_text", "text": "[]"},
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": "next",
+                            "arguments": json.dumps({"cmd": "echo continuing"}),
+                        },
+                    },
+                ],
+            )
+
+            summary = loop.parse_codex_session(path)
+            sessions = [summary]
+            for index in range(2):
+                duplicate = loop.SessionSummary(
+                    source="codex",
+                    path=Path(td) / f"json-empty-{index}.jsonl",
+                    session_id=f"json-empty-{index}",
+                )
+                original = summary.silent_empty[0]
+                duplicate.silent_empty.append(
+                    loop.Evidence(
+                        source=original.source,
+                        path=str(duplicate.path),
+                        line=original.line,
+                        kind=original.kind,
+                        excerpt=original.excerpt,
+                        session_id=duplicate.session_id,
+                        tool_name=original.tool_name,
+                        command=original.command,
+                    )
+                )
+                sessions.append(duplicate)
+            backlog = [p for p in loop.generate_proposals(sessions) if p["route"] == "backlog"]
+
+            self.assertEqual(len(summary.silent_empty), 1)
+            self.assertEqual(len(backlog), 1)
+            self.assertEqual(backlog[0]["target"]["name"], "widgetctl")
+
+    def test_grep_no_match_is_not_silent_empty(self):
+        summary = self._parse_claude_empty_result(
+            "rg needle haystack.txt", path_name="grep-empty.jsonl"
+        )
+        self.assertEqual(summary.silent_empty, [])
+
+    def test_final_empty_result_is_not_silent_empty(self):
+        summary = self._parse_claude_empty_result(
+            "orders-pp-cli orders list --json",
+            output="{}",
+            continue_after=False,
+            path_name="final-empty.jsonl",
+        )
+        self.assertEqual(summary.silent_empty, [])
+        self.assertEqual(
+            [p for p in loop.generate_proposals([summary]) if p["route"] == "tool"], []
+        )
+
+    def test_quiet_write_is_not_silent_empty(self):
+        summary = self._parse_claude_empty_result(
+            "widgetctl write --json --quiet", path_name="quiet-write.jsonl"
+        )
+        self.assertEqual(summary.silent_empty, [])
+
+    def test_error_status_empty_result_is_not_silent_empty(self):
+        summary = self._parse_claude_empty_result(
+            "widgetctl records --json",
+            output="[]",
+            is_error=True,
+            path_name="error-empty.jsonl",
+        )
+        self.assertEqual(summary.silent_empty, [])
+
+    def test_acknowledged_empty_result_is_not_swallowed(self):
+        summary = self._parse_claude_empty_result(
+            "widgetctl records --json",
+            output="[]",
+            continuation="No matching records; I will create the first one.",
+            path_name="acknowledged-empty.jsonl",
+        )
+        self.assertEqual(summary.silent_empty, [])
+
+    def test_compound_fetch_command_is_too_ambiguous_to_flag(self):
+        summary = self._parse_claude_empty_result(
+            "widgetctl records --json && git status --short",
+            output="[]",
+            path_name="compound-empty.jsonl",
+        )
+        self.assertEqual(summary.silent_empty, [])
+
+    def test_subagent_silent_empty_is_not_flagged_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "subagents" / "agent-1.jsonl"
+            summary = self._parse_claude_empty_result(
+                "orders-pp-cli orders list --json", output="{}", path=path
+            )
+            self.assertEqual(len(summary.silent_empty), 1)
+            proposals = loop.generate_proposals([summary])
+            self.assertFalse([p for p in proposals if p["target"]["name"] == "orders-pp-cli"])
+
+    def _parse_claude_empty_result(
+        self,
+        command,
+        output="",
+        continue_after=True,
+        continuation="Continuing.",
+        is_error=False,
+        path_name="empty.jsonl",
+        path=None,
+    ):
+        if path is None:
+            temp_dir = tempfile.TemporaryDirectory()
+            self.addCleanup(temp_dir.cleanup)
+            path = Path(temp_dir.name) / path_name
+        rows = [
+            {
+                "type": "assistant",
+                "sessionId": "empty-helper",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "empty-call",
+                            "name": "Bash",
+                            "input": {"command": command},
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": "empty-helper",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "empty-call",
+                            "is_error": is_error,
+                            "content": output,
+                        }
+                    ],
+                },
+            },
+        ]
+        if continue_after:
+            rows.append(
+                {
+                    "type": "assistant",
+                    "sessionId": "empty-helper",
+                    "message": {"role": "assistant", "content": continuation},
+                }
+            )
+        write_jsonl(path, rows)
+        return loop.parse_claude_session(path)
+
     def test_backlog_ignores_subagent_failures(self):
         def fail(session_id, path, line):
             return loop.Evidence(
@@ -1663,6 +1909,9 @@ class ConfigAndHealthTests(unittest.TestCase):
             set(loop.REMOTE_COMMAND_WRAPPERS),
             loop.INCLUDE_SUBAGENT_FAILURES,
             loop.VALIDATE_PP_CLI_CANDIDATES,
+            loop.DETECT_SILENT_EMPTY,
+            set(loop.SILENT_EMPTY_FETCH_VERBS),
+            set(loop.SILENT_EMPTY_IGNORE_EXECUTABLES),
         )
 
     def _restore_globals(self, snap):
@@ -1676,6 +1925,9 @@ class ConfigAndHealthTests(unittest.TestCase):
             wrappers,
             loop.INCLUDE_SUBAGENT_FAILURES,
             loop.VALIDATE_PP_CLI_CANDIDATES,
+            loop.DETECT_SILENT_EMPTY,
+            fetch_verbs,
+            silent_ignore,
         ) = snap
         loop.EXTRA_SCAFFOLD_MARKERS[:] = markers
         loop.SECRET_PATTERNS[:] = patterns
@@ -1683,6 +1935,10 @@ class ConfigAndHealthTests(unittest.TestCase):
         loop.BACKLOG_IGNORE_EXECUTABLES.update(ignore)
         loop.REMOTE_COMMAND_WRAPPERS.clear()
         loop.REMOTE_COMMAND_WRAPPERS.update(wrappers)
+        loop.SILENT_EMPTY_FETCH_VERBS.clear()
+        loop.SILENT_EMPTY_FETCH_VERBS.update(fetch_verbs)
+        loop.SILENT_EMPTY_IGNORE_EXECUTABLES.clear()
+        loop.SILENT_EMPTY_IGNORE_EXECUTABLES.update(silent_ignore)
 
     def test_config_overrides_detector_knobs(self):
         snap = self._snapshot_globals()
@@ -1695,6 +1951,9 @@ class ConfigAndHealthTests(unittest.TestCase):
                     "extra_backlog_ignore": ["mytool"],
                     "include_subagent_failures": True,
                     "validate_pp_cli_candidates": False,
+                    "detect_silent_empty": False,
+                    "silent_empty_fetch_verbs": ["lookup"],
+                    "silent_empty_ignore": ["quietctl"],
                 }
             )
             self.assertEqual(loop.pp_cli_names("stripe-acme-cli ls"), ["stripe-acme-cli"])
@@ -1706,6 +1965,9 @@ class ConfigAndHealthTests(unittest.TestCase):
             self.assertIn("mytool", loop.BACKLOG_IGNORE_EXECUTABLES)
             self.assertTrue(loop.INCLUDE_SUBAGENT_FAILURES)
             self.assertFalse(loop.VALIDATE_PP_CLI_CANDIDATES)
+            self.assertFalse(loop.DETECT_SILENT_EMPTY)
+            self.assertIn("lookup", loop.SILENT_EMPTY_FETCH_VERBS)
+            self.assertIn("quietctl", loop.SILENT_EMPTY_IGNORE_EXECUTABLES)
         finally:
             self._restore_globals(snap)
 
@@ -1783,6 +2045,82 @@ class McpFailureTests(unittest.TestCase):
             p for p in loop.generate_proposals([s1]) if p["target"]["kind"] == "mcp_server"
         ]
         self.assertEqual(proposals, [])
+
+    def test_recurring_mcp_silent_empty_routes_to_server(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "mcp-empty.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "assistant",
+                        "sessionId": "mcp-empty",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "mcp-fetch",
+                                    "name": "mcp__catalog__search_records",
+                                    "input": {"query": "fixture"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "mcp-empty",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "mcp-fetch",
+                                    "is_error": False,
+                                    "content": "null",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "sessionId": "mcp-empty",
+                        "message": {"role": "assistant", "content": "Continuing."},
+                    },
+                ],
+            )
+            summary = loop.parse_claude_session(path)
+            sessions = [summary]
+            for index in range(2):
+                duplicate = self._session(
+                    f"mcp-empty-{index}",
+                    [],
+                    path=str(Path(td) / f"mcp-empty-{index}.jsonl"),
+                )
+                original = summary.silent_empty[0]
+                duplicate.silent_empty.append(
+                    loop.Evidence(
+                        source=original.source,
+                        path=str(duplicate.path),
+                        line=original.line,
+                        kind=original.kind,
+                        excerpt=original.excerpt,
+                        session_id=duplicate.session_id,
+                        tool_name=original.tool_name,
+                        command=original.command,
+                    )
+                )
+                sessions.append(duplicate)
+            proposals = [
+                p
+                for p in loop.generate_proposals(sessions)
+                if p["target"]["kind"] == "mcp_server"
+            ]
+
+            self.assertEqual(len(summary.silent_empty), 1)
+            self.assertEqual(len(proposals), 1)
+            self.assertEqual(proposals[0]["target"]["name"], "mcp:catalog")
+            self.assertIn("3 swallowed empty result(s)", proposals[0]["summary"])
 
     def test_statusless_successful_mcp_output_is_not_staged(self):
         # Redacted from the successful CodeGraph calls rejected in the

@@ -163,10 +163,10 @@ See [`docs/OPEN_SOURCE.md`](docs/OPEN_SOURCE.md) for the public/private split, r
 
 The hard part is not noticing. It is deciding what kind of lesson you found. Proposals are routed to one of:
 
-- **`tool`** — a CLI failed _or got stuck_ on you in real use. Fix the tool, not the prompt. (By default it recognizes CLIs named `*-pp-cli`; see "Configuration" below.) Three kinds of friction are caught: hard **failures** (explicit `is_error` or non-zero exit), **hang/timeout** signals where the command actually stalled without a clean result, and **retry-before-success** — repeated use corroborated by a failure/hang or same-subcommand flag variation that looks like syntax guessing. The proposal summary breaks down which kinds fired and how many retries it took. For a printing-press CLI (resolved against `--printing-press-root`), the suggested action also names the source directory and points you at `/printing-press-amend` or `/printing-press-reprint`. Repeated **MCP tool failures** route here too, grouped per server (`mcp:<server>`): recurring failures usually mean expired auth, a broken server config, or a tool contract the agent keeps guessing wrong.
+- **`tool`** — a CLI failed _or got stuck_ on you in real use. Fix the tool, not the prompt. (By default it recognizes CLIs named `*-pp-cli`; see "Configuration" below.) Four kinds of friction are caught: hard **failures** (explicit `is_error` or non-zero exit), **hang/timeout** signals where the command actually stalled without a clean result, **retry-before-success** — repeated use corroborated by a failure/hang or same-subcommand flag variation that looks like syntax guessing — and **silent empty results** where a data-returning call exits cleanly with `[]`, `{}`, `null`, empty stdout, `0 rows`, `No results`, or `(empty)` and the agent continues without acknowledging the emptiness. The proposal summary breaks down which kinds fired and how many retries it took. For a printing-press CLI (resolved against `--printing-press-root`), the suggested action also names the source directory and points you at `/printing-press-amend` or `/printing-press-reprint`. Recurring MCP failures and swallowed empty results route here too, grouped per server (`mcp:<server>`).
 - **`skill_improvement`** — a reusable skill/command was used and the session later contained a correction. Patch the existing skill before creating a new one. Corrections that happened before the skill was invoked are treated as task context, not evidence that the skill failed.
 - **`memory_context`** — a durable correction not tied to a skill, grouped per project (`cwd`) so the review question is "what line in _this_ project's `CLAUDE.md` / `AGENTS.md` or runbook would have prevented this". Corrections are detected conservatively: explicitly corrective phrases count in normal-length messages, while ambient words like "do not" or "instead" only count in short reactive messages — a long task brief that says "do NOT change X" is an instruction, not a correction.
-- **`backlog`** — repeated tool failures worth tracking but not urgent, staged with evidence instead of a vague note. Failures inside subagent transcripts are excluded by default (exploratory subagents fail by design while probing).
+- **`backlog`** — repeated general-tool failures worth tracking but not urgent, plus recurring high-confidence swallowed empty results from general data-fetch commands. Both are staged with evidence instead of a vague note. Failures and silent-empty results inside subagent transcripts are excluded by default (exploratory subagents fail by design while probing).
 - **`content_idea`** — a real workflow or moment that may be useful public content. The MVP detects repeated/high-value slash command usage, command-level workflow clusters (task-ledger, executive-assistant, and revenue-watch loops), aggregate usage stories (`top skills`, command-line stack, most-used slash commands when present), and private-build signals such as message/search/CRM workflows. These proposals include content type, audience, rough outline, suggested `/last30days` query, confidence, recommendation, and privacy/redaction notes. They are editorial staging only: no drafting, posting, or publishing.
 
 And the most important non-route: **nothing.** One-off failures (a VPN was off) are discarded, not encoded. A system that cannot throw a lesson away turns into a haunted house of old warnings.
@@ -226,17 +226,31 @@ Detector defaults can be overridden without editing code. Put a JSON file at
 | `extra_redaction_patterns`      | `[regex, replacement]` pairs appended to the built-in secret masks                       |
 | `extra_backlog_ignore`          | Executables the `backlog` route should never blame                                       |
 | `extra_remote_command_wrappers` | Wrappers (like your ssh helper) whose quoted commands should be scanned for tracked CLIs |
-| `include_subagent_failures`     | Count failures from subagent transcripts toward `backlog` (default `false`)              |
+| `include_subagent_failures`     | Count failure/silent-empty signals from subagent transcripts (default `false`)            |
 | `validate_pp_cli_candidates`    | Drop code-literal-only CLI names missing from an available source tree (default `true`)  |
+| `detect_silent_empty`           | Detect swallowed structurally empty data results (default `true`)                        |
+| `silent_empty_fetch_verbs`      | Extra command/subcommand verbs that clearly intend to return data                        |
+| `silent_empty_ignore`           | Executables whose empty output should always be treated as normal success                 |
 
 General tool failures are still captured by the `backlog` route regardless of the tracked suffix.
 
 If your CLI sources live somewhere other than `~/printing-press`, pass `--printing-press-root PATH` (or set `PRINTING_PRESS_ROOT`). The loop maps `<name>-pp-cli` to the first of `<root>/library/<name>`, `<root>/manuscripts/<name>`, or `<root>/<name>` that exists on disk; if none exist, the proposal simply omits the source line.
 
+## Limitations — what it won't catch
+
+This loop mines **interactive agent transcripts**. It catches breakages that surfaced _in the session_: a non-zero exit, an error flag, a hang, a retry, a correction you typed, or the narrow case where a clearly data-returning call produced a structurally empty result and the agent kept going.
+
+So it is blind to failures that exit clean and never get corrected:
+
+- **Silently wrong output.** A command exits 0 but returns stale, degraded, or plausible-but-wrong data — a drifted payload shape, a cache that never refreshed. The detector catches only structurally empty results (`[]`, `{}`, `null`, empty stdout, `0 rows`, `No results`, or `(empty)`) that were swallowed before another step. Non-empty stale or wrong data still has no in-session failure signal to mine.
+- **Out-of-band failures.** A cron that fires with stale data, a webhook whose contract drifted in production — these never appear in an agent transcript at all, so they are outside the corpus, not merely hard to find.
+
+The rest of this class needs a **different loop**: one that watches outputs and production — schema assertions, freshness checks, output diffing — not session logs. That is a sibling tool, not a knob on this one.
+
 ## Roadmap
 
 - Repeated-command-chain detection, not just executable names.
-- Silent-null JSON detection (command exits 0 but returns empty data) and "manual parsing where a `--json` path exists."
+- Detect manual parsing where a `--json` path exists.
 - A `--review` mode that reads the latest packet and walks the apply / defer / reject decisions with you.
 - Extract embedded shell commands from code-runtime tool calls for the `backlog` route (tracked CLIs inside code literals are already detected; general executables are not).
 
