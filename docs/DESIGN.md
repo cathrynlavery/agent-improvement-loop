@@ -23,14 +23,15 @@ Every transcript reduces to tool calls, CLI invocations, skill invocations, fail
 - Actual CLI use (matching the tracked-CLI pattern), not prose mentions inside arbitrary command arguments. Recognizes direct shell execution and quoted remote-shell commands.
 - Tool failure/friction. Claude Code marks failed tool calls with an explicit `is_error` flag; that flag is trusted when present. Text heuristics (exit-status lines, error phrases) are the fallback for transcripts that lack it, so successful build logs that merely contain the word "error" are not treated as failures.
 - Hang/timeout signals, classified only from tool output — never from the command text, so `timeout 120 foo-cli ...` is not itself a hang.
+- Silent-empty results. A call qualifies only when it has no existing failure/hang signal, clearly intends to return data (tracked CLI, MCP read, JSON output shape, or a small known/configured fetch-verb set), returns exactly `[]`, `{}`, `null`, empty stdout, `0 rows`, `No results`, or `(empty)`, and a later agent step proves the result was swallowed rather than surfaced at the end of the session. Normal-success commands (`grep`/`rg` no-match, tests, writes, filesystem mutations, and quiet invocations) are excluded. Ambiguous multi-command Codex runtime calls are also excluded because an empty result cannot be attributed safely.
 - User corrections, excluding transcript scaffolding. Any user message that opens with an XML-ish tag is scaffolding (injected instructions, task seeds, notifications), plus an explicit marker list and config-supplied extras. Correction cues are tiered: explicitly corrective phrases ("that's wrong", "not what I asked") count in normal-length messages; ambient words ("do not", "instead", "actually") only count in short reactive messages.
 
 ## Routing
 
-- `tool`: real CLI use produced a failure/hang/retry signal, or an MCP server accumulated repeated failed tool calls (grouped per server as `mcp:<server>`). Fix the CLI or server contract.
+- `tool`: real tracked-CLI use produced a failure/hang/retry/silent-empty signal, or an MCP server accumulated recurring failure/silent-empty evidence (grouped per server as `mcp:<server>`). Fix the CLI or server contract.
 - `skill_improvement`: a skill was invoked and the same session later contains a correction. Prefer patching the existing skill.
 - `memory_context`: corrections not tied to a skill, grouped per project (`cwd`) and capped per session, so one busy session cannot flood the packet. Promote only durable preferences or runbook facts.
-- `backlog`: repeated tool failures across sessions. Subagent transcripts are excluded by default (exploratory subagents fail by design), and code-runtime inputs are skipped because there is no shell executable to blame. Decide durable vs transient before creating a task.
+- `backlog`: repeated general-tool failures across sessions, plus recurring attributable silent-empty results from general data-fetch commands. Subagent transcripts are excluded by default (exploratory subagents fail by design), and ambiguous code-runtime inputs are skipped because there is no single shell executable to blame. Decide durable vs transient before creating a task.
 - `content_idea`: real workflows or moments worth considering for public content. Stage editorial proposals with audience, outline, last30days query, confidence, recommendation, and privacy notes; never draft or publish automatically. Detectors include high-signal slash commands, command-level workflow clusters, private-build signals, and aggregate usage stories such as top skills, most-used CLI tools, loop examples, and slash-command roundups when transcript data contains them.
 
 Proposal IDs are deterministic from route, target, and evidence references, so daily scans avoid restaging the same item unless `--include-seen` is passed.
@@ -60,7 +61,7 @@ Each run records per-source parse statistics (files scanned, tool calls parsed).
 
 ## Configuration
 
-Detector knobs live in an optional JSON config (`~/.agent-improvement/config.json` or `--config`): the tracked-CLI suffix, extra scaffold markers, extra redaction patterns, extra backlog ignores, extra remote-command wrappers, and whether subagent failures count. Defaults stay generic; personal workflow details belong in the config file, not the source.
+Detector knobs live in an optional JSON config (`~/.agent-improvement/config.json` or `--config`): the tracked-CLI suffix, extra scaffold markers, extra redaction patterns, extra backlog ignores, extra remote-command wrappers, whether subagent failures count, and silent-empty detection controls (`detect_silent_empty`, extra fetch verbs, and ignored executables). Defaults stay generic; personal workflow details belong in the config file, not the source.
 
 ## Safety model
 

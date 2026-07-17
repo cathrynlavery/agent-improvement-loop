@@ -8,5 +8,8 @@
   "extra_backlog_ignore": ["mycorp-wrapper"],
   "extra_remote_command_wrappers": ["myssh"],
   "include_subagent_failures": false,
-  "validate_pp_cli_candidates": true
+  "validate_pp_cli_candidates": true,
+  "detect_silent_empty": true,
+  "silent_empty_fetch_verbs": ["lookup"],
+  "silent_empty_ignore": ["my-empty-is-ok-tool"]
 }
