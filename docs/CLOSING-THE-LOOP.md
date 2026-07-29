@@ -27,7 +27,8 @@ The split matters: the daily pass has no shell, so it can never push code or tou
 4. **Stale-lock protocol.** A 0-byte `.git/index.lock` under a *running* git process is normal mid-operation state — removing it corrupts live work. Check for a live process first; only remove orphaned locks.
 5. **One file per entry, filename = ID.** Aggregate append-files written by concurrent sessions on multiple machines produce sync conflicts and lost edits. Per-entry files also make `Status` greps see the whole store.
 6. **Verification is a named observation, not a green exit.** Exit 0, a passing `doctor`, and an installed binary are not evidence. A row count equal to the page size is a failure signal. "Unverified" is always a legal outcome; a confident wrong number is not.
-7. **The loop eats its own dog food.** The miner must filter the loop's own injected prompts and notifications out of correction detection, or the system flags itself as user friction.
+7. **Liveness signals live outside protected paths.** On macOS, launchd's `/bin/bash` may be unable to write TCC-protected or cloud-synced directories even while the agent process it spawns can — so a run can succeed while its dead-man log line fails silently, the exact blindness the line exists to prevent. Write the RUN log to a plainly writable location (`~/Library/Logs`); a copy inside the store is a mirror, never the signal.
+8. **The loop eats its own dog food.** The miner must filter the loop's own injected prompts and notifications out of correction detection, or the system flags itself as user friction.
 
 ## Files here
 

@@ -7,11 +7,15 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 LEARNINGS_DIR="$HOME/.learnings"                 # your store
 REPO_ROOT="$LEARNINGS_DIR"                       # repo containing the store (may be a parent dir)
 PROMPT_FILE="$(dirname "$0")/fixloop-prompt.md"  # the triage prompt
-FIXLOG="$LEARNINGS_DIR/fixloop-log.md"
+# Liveness log lives OUTSIDE the store: on macOS, launchd's /bin/bash often
+# cannot write TCC-protected or cloud-synced paths (~/Library/CloudStorage)
+# even when the spawned agent process can — the run then succeeds while the
+# dead-man line fails silently. Keep the signal somewhere always writable.
+FIXLOG="$HOME/Library/Logs/learnings-fixloop-runs.log"
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-[ -f "$FIXLOG" ] || printf '# Fixloop log — one line per daily run\n\n' > "$FIXLOG"
+touch "$FIXLOG"
 
 if [ ! -x "$CLAUDE_BIN" ]; then
   printf 'RUN %s exit=missing-claude\n' "$NOW" >> "$FIXLOG"
