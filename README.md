@@ -153,6 +153,10 @@ Fix workflows can import a batch handoff with `--resolve-from decisions.json`. T
 
 For `content_idea`, personal/private sessions are allowed as local source material, but the public output is intentionally conservative: high-risk content evidence suppresses command and excerpt text even when `--full` is enabled. Use the idea as a starting point, then remove names, raw messages, customer/client details, family details, auth material, exact private metrics, and any other identifying specifics before drafting or publishing.
 
+### From staged proposals to executed fixes
+
+Staging is half the loop. The other half — a scheduled headless triage pass that promotes/resolves/queues, and an interactive `learn-loop` session that executes the queue with test gates and closes every entry's status — is documented in [docs/CLOSING-THE-LOOP.md](docs/CLOSING-THE-LOOP.md), with a ready-to-adapt skill (`skills/learn-loop/`), the triage prompt and runner shim (`templates/`), and a LaunchAgent example (`examples/`).
+
 ## Open-source and private forks
 
 This repo should stay public-safe. Put private detector catalogs, copied logs, real run outputs, receipts, and dogfood artifacts in a private fork or ignored local files such as `private/` and `.agent-improvement/`.
