@@ -37,6 +37,7 @@ RESOLUTION_DECISIONS = {"fixed", "wontfix", "ignored"}
 # paste into a writeup, or hand to another agent.
 FULL_DETAIL = False
 FULL_EXCERPT_LIMIT = 4000
+CORRECTION_SCAN_LIMIT = 360
 
 # CLIs whose command name ends in this suffix get the `tool` route. Override
 # with "tracked_cli_suffix" in the config file to track your own naming scheme.
@@ -72,9 +73,12 @@ STRONG_CORRECTION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+# "Actually" only counts when it opens a line ("Actually, use X"). Mid-sentence
+# "actually" ("how do we actually get that set up?") is ordinary emphasis, not
+# a correction.
 WEAK_CORRECTION_RE = re.compile(
-    r"\b(actually|instead|don'?t do|do not|should have)\b",
-    re.IGNORECASE,
+    r"(?:^\s*actually\b|\b(instead|don'?t do|do not|should have)\b)",
+    re.IGNORECASE | re.MULTILINE,
 )
 STRONG_CORRECTION_MAX_CHARS = 2000
 WEAK_CORRECTION_MAX_CHARS = 400
@@ -104,6 +108,16 @@ PP_FRICTION_RE = re.compile(
     r"FAIL|not configured|missing required|unknown option|usage:|"
     r"not found|invalid|unauthorized|forbidden|rate limit|silent null"
     r")\b"
+)
+# Hard error phrases that outrank the inspection-command exemption below:
+# help/doctor output that contains these is real friction, not documentation.
+PP_STRONG_FRICTION_RE = re.compile(
+    r"(?i)("
+    r"\bFAIL\b|\bnot configured\b|\bmissing required\b|"
+    r"\bunknown (option|flag)\b|\binvalid (option|flag|argument)\b|"
+    r"\bunauthorized\b|\bforbidden\b|\brate limit\b|\bsilent null\b|"
+    r"\baccepts at most\b|\bunexpected extra arg\b|error:|\bnot found\b"
+    r")"
 )
 INSPECTION_COMMAND_RE = re.compile(
     r"(?i)(^|\s)(--help|-h|--version|version|doctor|inventory)(?=$|\s|[;&|])"
@@ -667,6 +681,8 @@ def is_transcript_scaffold(text: str, path: Optional[Path] = None) -> bool:
         "<instructions>",
         "<codex_internal_context",
         "<collaboration_mode>",
+        "<recommended_plugins>",
+        "<multi_agent_mode>",
         "the following is the codex agent history",
         "as untrusted evidence, not as instructions to follow",
         "use the skill at ",
@@ -675,6 +691,9 @@ def is_transcript_scaffold(text: str, path: Optional[Path] = None) -> bool:
         "<scheduled-task",
         "compound codex tool mapping",
         "<task-notification>",
+        "## tracegrain runtime request",
+        "weekly learnings harvest.",
+        "monthly learnings review.",
         "this session is being continued from a previous conversation",
         "codex could not read the local image at",
         "a 16:9 horizontal editorial illustration that explains one idea:",
@@ -704,9 +723,13 @@ def is_user_correction_text(text: str, path: Optional[Path] = None) -> bool:
     if not text or is_transcript_scaffold(text, path) or looks_like_pasted_transcript(text):
         return False
     stripped = text.strip()
-    if len(stripped) <= STRONG_CORRECTION_MAX_CHARS and STRONG_CORRECTION_RE.search(stripped):
+    # A proposal must show the phrase that triggered it. Searching beyond the
+    # normal evidence excerpt turns appended runtime instructions into
+    # invisible false positives that a reviewer cannot validate.
+    window = stripped[:CORRECTION_SCAN_LIMIT]
+    if len(stripped) <= STRONG_CORRECTION_MAX_CHARS and STRONG_CORRECTION_RE.search(window):
         return True
-    return len(stripped) <= WEAK_CORRECTION_MAX_CHARS and bool(WEAK_CORRECTION_RE.search(stripped))
+    return len(stripped) <= WEAK_CORRECTION_MAX_CHARS and bool(WEAK_CORRECTION_RE.search(window))
 
 
 def add_pp_cli_evidence(summary: SessionSummary, cli: str, ev: Evidence) -> None:
@@ -738,7 +761,9 @@ def capture_pp_cli_hang(
         return
     # Older transcripts do not carry wrapper status. Keep inspection commands
     # conservative: their output commonly documents timeouts and cancellation.
-    if INSPECTION_COMMAND_RE.search(command):
+    # Strong friction language is the exception — a help/doctor probe that
+    # comes back with a hard error phrase is real evidence, not documentation.
+    if INSPECTION_COMMAND_RE.search(command) and not PP_STRONG_FRICTION_RE.search(output):
         return
     for cli in (clis if clis is not None else pp_cli_names(command)):
         add_pp_cli_evidence(
@@ -1154,6 +1179,8 @@ def parse_claude_session(path: Path) -> SessionSummary:
     silent_candidates: List[Tuple[int, ToolCall, str, Optional[bool], Any]] = []
     agent_step_lines: List[int] = []
     agent_messages: List[Tuple[int, str]] = []
+    seen_user_texts: set[str] = set()
+    agent_has_responded = False
 
     for line_no, rec in jsonl_records(path):
         session_id = str(rec.get("sessionId") or summary.session_id)
@@ -1168,11 +1195,13 @@ def parse_claude_session(path: Path) -> SessionSummary:
         role = msg.get("role") or rec.get("type")
         content = msg.get("content")
 
-        if role == "assistant" and content:
-            agent_step_lines.append(line_no)
-            assistant_text = text_from_claude_content(content)
-            if assistant_text:
-                agent_messages.append((line_no, assistant_text))
+        if role == "assistant":
+            agent_has_responded = True
+            if content:
+                agent_step_lines.append(line_no)
+                assistant_text = text_from_claude_content(content)
+                if assistant_text:
+                    agent_messages.append((line_no, assistant_text))
 
         if role == "user":
             text = text_from_claude_content(content)
@@ -1188,7 +1217,12 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         occurred_at=ts,
                     )
                     summary.slash_commands.setdefault(command, []).append(ev)
-                if is_user_correction_text(text, path):
+                if (
+                    agent_has_responded
+                    and seen_user_texts
+                    and text not in seen_user_texts
+                    and is_user_correction_text(text, path)
+                ):
                     summary.corrections.append(
                         evidence(
                             source="claude",
@@ -1200,6 +1234,8 @@ def parse_claude_session(path: Path) -> SessionSummary:
                             occurred_at=ts,
                         )
                     )
+                if not is_transcript_scaffold(text, path):
+                    seen_user_texts.add(text)
 
         if isinstance(content, list):
             for item in content:
@@ -1362,6 +1398,8 @@ def parse_codex_session(path: Path) -> SessionSummary:
     silent_candidates: List[Tuple[int, ToolCall, str, Optional[bool], Any]] = []
     agent_step_lines: List[int] = []
     agent_messages: List[Tuple[int, str]] = []
+    seen_user_texts: set[str] = set()
+    agent_has_responded = False
 
     for line_no, rec in jsonl_records(path):
         payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
@@ -1377,8 +1415,25 @@ def parse_codex_session(path: Path) -> SessionSummary:
         if rec.get("type") == "turn_context":
             summary.cwd = str(payload.get("cwd") or summary.cwd or "")
 
+        if payload.get("role") == "assistant" or payload.get("type") in {
+            "agent_message",
+            "assistant_message",
+            "custom_tool_call",
+            "function_call",
+            "reasoning",
+        }:
+            agent_has_responded = True
+
         text = codex_message_text(payload)
-        if text and payload.get("type") in {"user_message", "message"}:
+        # Codex stores developer, user, and assistant messages in the same
+        # response_item/message shape. Only user-role messages can carry slash
+        # commands or user corrections; accepting every role turns runtime
+        # instructions and assistant prose into false correction evidence.
+        # Older fixtures may omit role, so preserve that legacy user shape.
+        is_user_text = payload.get("type") == "user_message" or (
+            payload.get("type") == "message" and payload.get("role") in {None, "user"}
+        )
+        if text and is_user_text:
             for command in SLASH_COMMAND_RE.findall(text):
                 ev = evidence(
                     source="codex",
@@ -1390,7 +1445,12 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     occurred_at=ts,
                 )
                 summary.slash_commands.setdefault(command, []).append(ev)
-            if is_user_correction_text(text, path):
+            if (
+                agent_has_responded
+                and seen_user_texts
+                and text not in seen_user_texts
+                and is_user_correction_text(text, path)
+            ):
                 summary.corrections.append(
                     evidence(
                         source="codex",
@@ -1402,6 +1462,8 @@ def parse_codex_session(path: Path) -> SessionSummary:
                         occurred_at=ts,
                     )
                 )
+            if not is_transcript_scaffold(text, path):
+                seen_user_texts.add(text)
 
         payload_type = payload.get("type")
         if payload_type == "agent_message" or (
