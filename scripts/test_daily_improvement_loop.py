@@ -238,7 +238,10 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                 {
                                     "type": "tool_result",
                                     "tool_use_id": "call5",
-                                    "content": "Usage: wavespeed-pp-cli run [model-or-alias] [flags]",
+                                    "content": (
+                                        "Usage: wavespeed-pp-cli run [model-or-alias] [flags]\n"
+                                        "      --timeout-ms int   Optional timeout in milliseconds"
+                                    ),
                                 }
                             ],
                         },
@@ -248,6 +251,33 @@ class DailyImprovementLoopTests(unittest.TestCase):
             summary = loop.parse_claude_session(path)
             proposals = loop.generate_proposals([summary])
             self.assertFalse([p for p in proposals if p["route"] == "tool"])
+
+    def test_skill_correction_must_follow_skill_invocation(self):
+        summary = loop.SessionSummary(source="claude", path=Path("x"), session_id="s7")
+        summary.corrections.append(
+            loop.Evidence(
+                source="claude",
+                path="x",
+                line=10,
+                kind="user_correction",
+                excerpt="Actually, use the JSON endpoint.",
+                session_id="s7",
+            )
+        )
+        summary.skill_invocations["example-skill"] = [
+            loop.Evidence(
+                source="claude",
+                path="x",
+                line=20,
+                kind="skill_invocation",
+                excerpt="Skill(example-skill)",
+                session_id="s7",
+            )
+        ]
+
+        proposals = loop.generate_proposals([summary])
+
+        self.assertFalse([p for p in proposals if p["route"] == "skill_improvement"])
 
     def test_text_only_pp_cli_failure_language_is_not_hard_failure(self):
         # Redacted from the rejected meta-ads/doctor probes in the 20260716
@@ -632,12 +662,114 @@ class DailyImprovementLoopTests(unittest.TestCase):
             )
         )
 
+    def test_runtime_scaffolding_is_not_user_correction(self):
+        scaffold_messages = [
+            "Weekly learnings harvest. You are running unattended; do not ask questions.",
+            "<task-notification><status>completed</status><note>Do not reply.</note></task-notification>",
+            "<codex_internal_context source=\"goal\">Continue working toward the active goal.</codex_internal_context>",
+            "<recommended_plugins>Do not install unless needed.</recommended_plugins>",
+            "## Tracegrain Runtime Request\nReturn exactly one JSON object and no prose.",
+            "<multi_agent_mode>Do not spawn sub-agents unless explicitly requested.</multi_agent_mode>",
+        ]
+        for text in scaffold_messages:
+            with self.subTest(text=text):
+                self.assertFalse(loop.is_user_correction_text(text))
+
+    def test_actually_inside_a_question_is_not_a_correction(self):
+        self.assertFalse(
+            loop.is_user_correction_text(
+                "They want to use an email address. How do we actually get that set up?"
+            )
+        )
+        self.assertTrue(loop.is_user_correction_text("Actually, use the JSON endpoint."))
+
+    def test_correction_marker_outside_evidence_excerpt_is_ignored(self):
+        text = "Initial task details. " + ("x" * 400) + " Do not expose runtime scaffolding."
+        self.assertFalse(loop.is_user_correction_text(text))
+
+    def test_codex_non_user_messages_are_not_corrections(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "codex.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "developer",
+                            "content": [{"type": "input_text", "text": "Do not expose secrets."}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "input_text", "text": "Actually, the task is complete."}],
+                        },
+                    },
+                ],
+            )
+
+            summary = loop.parse_codex_session(path)
+
+            self.assertEqual(summary.corrections, [])
+
+    def test_initial_user_directive_is_not_a_correction(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "codex.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "Project context follows in the next message.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "Implement the pipeline. Do not merely describe it; edit the repo instead.",
+                                }
+                            ],
+                        },
+                    },
+                ],
+            )
+
+            summary = loop.parse_codex_session(path)
+
+            self.assertEqual(summary.corrections, [])
+
     def test_proposals_are_routed(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             write_jsonl(
                 path,
                 [
+                    {
+                        "type": "user",
+                        "sessionId": "s1",
+                        "timestamp": "2026-06-14T23:59:59Z",
+                        "message": {
+                            "role": "user",
+                            "content": "Deploy the service.",
+                        },
+                    },
                     {
                         "type": "assistant",
                         "sessionId": "s1",
@@ -899,6 +1031,30 @@ class DailyImprovementLoopTests(unittest.TestCase):
 
         self.assertIn("hang/timeout", proposal["summary"])
         self.assertIn("retried up to 3x", proposal["summary"])
+
+    def test_distinct_pp_cli_subcommands_are_not_counted_as_retries(self):
+        summary = loop.SessionSummary(source="claude", path=Path("x"), session_id="r2")
+        commands = [
+            "granola-pp-cli --version",
+            "granola-pp-cli doctor; granola-pp-cli export-all --help",
+            "granola-pp-cli sync --agent; granola-pp-cli stats --agent",
+        ]
+        summary.pp_cli_invocations["granola-pp-cli"] = [
+            loop.Evidence(
+                source="claude",
+                path="x",
+                line=index,
+                kind="pp_cli_invocation",
+                excerpt=command,
+                session_id="r2",
+                command=command,
+            )
+            for index, command in enumerate(commands, 1)
+        ]
+
+        proposals = loop.generate_proposals([summary])
+
+        self.assertEqual([p for p in proposals if p["route"] == "tool"], [])
 
     def test_printing_press_source_line_added_to_tool_proposal(self):
         with tempfile.TemporaryDirectory() as td:
