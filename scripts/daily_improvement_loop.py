@@ -3545,6 +3545,28 @@ def filter_new_proposals(
     return ProposalFilterResult(emitted, suppressed, regressions, resolved_nonregressions)
 
 
+def proposals_for_fleet_snapshot(
+    detected: List[Dict[str, Any]],
+    state: Dict[str, Any],
+    resolutions: Optional[Dict[str, Dict[str, str]]] = None,
+    include_resolved: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return all currently active proposals for a latest-wins fleet bundle.
+
+    Local packets remain delta-oriented, but collectors replace each machine's
+    prior bundle with its newest one. The bundle therefore must be a snapshot
+    of active unresolved proposals rather than only newly-seen proposal keys.
+    """
+    candidates = copy.deepcopy(detected)
+    return filter_new_proposals(
+        candidates,
+        state,
+        include_seen=True,
+        resolutions=resolutions,
+        include_resolved=include_resolved,
+    ).proposals
+
+
 def compute_since(args: argparse.Namespace, state: Dict[str, Any]) -> Optional[dt.datetime]:
     if args.all:
         return None
@@ -3650,6 +3672,12 @@ def scan(args: argparse.Namespace) -> int:
     pp_root = Path(pp_root_arg).expanduser() if pp_root_arg else None
     detected = generate_proposals(sessions, pp_root, route=args.route)
     annotate_recurrence(detected, state, resolutions)
+    fleet_proposals = proposals_for_fleet_snapshot(
+        detected,
+        state,
+        resolutions,
+        args.include_resolved,
+    )
     filtered = filter_new_proposals(
         detected,
         state,
@@ -3674,6 +3702,7 @@ def scan(args: argparse.Namespace) -> int:
         "files_scanned": len(files) + hermes_db_count + paperclip_source_count,
         "sessions_with_signals": len(sessions),
         "proposal_count": len(proposals),
+        "fleet_proposal_count": len(fleet_proposals),
         "resolved_suppressed_count": len(filtered.suppressed),
         "resolved_suppressed_targets": suppressed_targets,
         "regression_count": len(filtered.regressions),
@@ -3717,11 +3746,12 @@ def scan(args: argparse.Namespace) -> int:
     state["seen_proposal_keys"] = sorted(seen)
     write_json(root / "state.json", state)
     write_json(root / "runs" / f"{run_id}.json", {**result, "review_packet": str(packet_path)})
-    bundle_path = write_fleet_bundle(root, run_id, machine, result, proposals)
+    bundle_path = write_fleet_bundle(root, run_id, machine, result, fleet_proposals)
 
     print(
         f"machine={machine} scanned={result['files_scanned']} "
-        f"sessions_with_signals={len(sessions)} proposals={len(proposals)}"
+        f"sessions_with_signals={len(sessions)} proposals={len(proposals)} "
+        f"fleet_proposals={len(fleet_proposals)}"
     )
     print(
         f"resolved_suppressed={len(filtered.suppressed)} "

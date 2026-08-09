@@ -2824,6 +2824,34 @@ class ResolutionTests(unittest.TestCase):
             self.assertNotIn(leaked, serialized)
             self.assertIn("<redacted-paperclip-key>", serialized)
 
+    def test_fleet_snapshot_keeps_seen_unresolved_proposals(self):
+        ev = loop.Evidence(
+            source="codex",
+            path="session.jsonl",
+            line=1,
+            kind="tool_failure",
+            excerpt="Error: unknown flag",
+            machine="silverfox",
+        )
+        proposal = loop.make_proposal(
+            route="tool",
+            title="Review demo CLI",
+            summary="One failure",
+            target_kind="tool",
+            target_name="demo-pp-cli",
+            evidence_items=[ev],
+            suggested_action="Review",
+            impact=["Retry"],
+        )
+        state = {"seen_proposal_keys": [proposal["proposal_key"]]}
+
+        local_delta = loop.filter_new_proposals([proposal], state, include_seen=False)
+        fleet_snapshot = loop.proposals_for_fleet_snapshot([proposal], state)
+
+        self.assertEqual(local_delta.proposals, [])
+        self.assertEqual(len(fleet_snapshot), 1)
+        self.assertEqual(fleet_snapshot[0]["proposal_key"], proposal["proposal_key"])
+
     def test_fleet_collector_resanitizes_a_peer_bundle(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "queue"
