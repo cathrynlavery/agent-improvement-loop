@@ -115,7 +115,10 @@ Proposals whose target was already flagged in previous runs are marked as recurr
 Run the scanner locally on every Mac so raw Claude, Codex, and Hermes session
 stores remain on the machine where they were created. Each ordinary scan writes
 one redacted proposal bundle under `fleet-outbox/<machine>/`; `--full` disables
-bundle output so unredacted evidence cannot enter the fleet handoff.
+bundle output so unredacted evidence cannot enter the fleet handoff. Local
+review packets remain deduplicated deltas, while the fleet bundle is a snapshot
+of every currently active unresolved proposal so a latest-wins collector cannot
+forget older open work.
 
 Choose one review leader. Copy only the bundle JSON files into its
 `fleet-inbox/<machine>/` directories, then run:
@@ -126,7 +129,9 @@ agent-improvement-loop --collect-fleet \
 ```
 
 The resulting `*-fleet.md` packet carries machine provenance on every proposal.
-Do not run multiple review leaders against the same aggregate queue.
+The producer recursively sanitizes every string at bundle write time, and the
+collector repeats that sanitization instead of trusting a peer's `redacted`
+marker. Do not run multiple review leaders against the same aggregate queue.
 
 ## Closing the loop / resolutions
 
