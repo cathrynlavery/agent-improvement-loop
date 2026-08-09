@@ -2670,6 +2670,131 @@ class ResolutionTests(unittest.TestCase):
         self.assertIn("## Regressions re-opened after a fix", packet)
         self.assertIn("tool:cloudflare-pp-cli", packet)
 
+    def test_hermes_parser_ignores_persona_scaffold_and_attributes_machine(self):
+        rows = [
+            (1, "user", "# Porter — system persona\nDo not change policy.", "", "", 1780000000.0),
+            (2, "user", "Inspect the current API integration.", "", "", 1780000001.0),
+            (3, "assistant", "Understood", "", "", 1780000002.0),
+            (4, "user", "Actually use the canonical endpoint.", "", "", 1780000003.0),
+            (
+                5,
+                "assistant",
+                "",
+                json.dumps(
+                    [
+                        {
+                            "id": "callh",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": json.dumps(
+                                    {"command": "shopify-pp-cli products list"}
+                                ),
+                            },
+                        }
+                    ]
+                ),
+                "",
+                1780000004.0,
+            ),
+            (6, "tool", "Exit code: 1\nError: forbidden", "", "callh", 1780000005.0),
+        ]
+        summary = loop.parse_hermes_messages(
+            source="hermes_profile_log",
+            path=Path("/tmp/state.db"),
+            profile="chief",
+            session_id="h1",
+            rows=rows,
+        )
+        loop.stamp_session_machine(summary, "silverfox")
+        self.assertEqual(len(summary.corrections), 1)
+        self.assertEqual(summary.corrections[0].machine, "silverfox")
+        self.assertEqual(sorted(summary.pp_cli_invocations), ["shopify-pp-cli"])
+        proposal = next(
+            item
+            for item in loop.generate_proposals([summary])
+            if item["target"]["name"] == "shopify-pp-cli"
+        )
+        self.assertEqual(proposal["machines"], ["silverfox"])
+        self.assertTrue(all(item["machine"] == "silverfox" for item in proposal["evidence"]))
+
+    def test_backlog_executable_rejects_shell_fragments(self):
+        for command in (
+            "# comment",
+            "case $value in",
+            "do",
+            "COMPANY_ID=abc",
+            "body=$(cat <<'EOF'",
+            "*) echo nope",
+            '}"',
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(loop.backlog_executable(command), "")
+
+    def test_collect_fleet_bundles_uses_latest_redacted_bundle_per_machine(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "queue"
+            inbox = root / "fleet-inbox"
+            for machine, run_id in (
+                ("silverfox", "20260809T100000Z"),
+                ("studio", "20260809T100100Z"),
+            ):
+                ev = loop.Evidence(
+                    source="codex",
+                    path=f"/Users/test/{machine}/session.jsonl",
+                    line=4,
+                    kind="tool_failure",
+                    excerpt="Error: unknown flag",
+                    command="demo-pp-cli list --bad",
+                    machine=machine,
+                )
+                proposal = loop.make_proposal(
+                    route="tool",
+                    title="Review demo CLI",
+                    summary="One failure",
+                    target_kind="tool",
+                    target_name="demo-pp-cli",
+                    evidence_items=[ev],
+                    suggested_action="Review",
+                    impact=["Retry"],
+                )
+                loop.write_json(
+                    inbox / machine / f"{run_id}.json",
+                    {
+                        "schema_version": 1,
+                        "redacted": True,
+                        "machine": machine,
+                        "run_id": run_id,
+                        "sessions_with_signals": 1,
+                        "proposal_count": 1,
+                        "proposals": [proposal],
+                    },
+                )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    loop.main(
+                        [
+                            "--output-root",
+                            str(root),
+                            "--fleet-inbox",
+                            str(inbox),
+                            "--collect-fleet",
+                        ]
+                    ),
+                    0,
+                )
+            packet_path = Path(
+                next(
+                    line.split("=", 1)[1]
+                    for line in output.getvalue().splitlines()
+                    if line.startswith("review_packet=")
+                )
+            )
+            packet = packet_path.read_text(encoding="utf-8")
+            self.assertIn("Machines: silverfox, studio", packet)
+            self.assertIn("silverfox-imp-", packet)
+            self.assertIn("studio-imp-", packet)
+
 
 if __name__ == "__main__":
     unittest.main()

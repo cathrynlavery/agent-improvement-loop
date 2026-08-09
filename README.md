@@ -66,7 +66,10 @@ agent-improvement-loop --since-days 1
 | `--since-days N`                         | Scan sessions modified within N days                                                                                                                                               |
 | `--all`                                  | Backfill every discovered session                                                                                                                                                  |
 | `--max-sessions N`                       | Keep only the most recent N after filtering                                                                                                                                        |
-| `--source {all,claude,codex}`            | Which transcripts to read (default `all`)                                                                                                                                          |
+| `--source {all,claude,codex,hermes_profile_log,paperclip_run}` | Which local session source to read (default `all`)                                                                                                              |
+| `--machine NAME`                         | Stable fleet machine name embedded in sessions, proposals, and redacted bundle metadata                                                                                            |
+| `--collect-fleet`                        | Merge the latest redacted bundle per machine from `--fleet-inbox` into one fleet review packet                                                                                     |
+| `--fleet-inbox PATH`                     | Root containing `<machine>/<run-id>.json` redacted bundles for `--collect-fleet`                                                                                                    |
 | `--route {all,improvement,content_idea}` | Stage operational improvements, content ideas, or both (default `improvement`)                                                                                                     |
 | `--include-seen`                         | Re-emit proposals even if their key was seen before                                                                                                                                |
 | `--include-resolved`                     | Debug bypass for the resolutions registry; seen-key filtering still applies unless `--include-seen` is also passed                                                                |
@@ -95,6 +98,8 @@ agent-improvement-loop --since-days 1
   runs/<run-id>.json             # run metadata
   proposals/<run-id>/*.json      # one staged proposal per file
   review-packets/<run-id>.md     # the human-readable packet you review
+  fleet-outbox/<machine>/*.json  # redacted proposals only; safe fleet handoff
+  fleet-inbox/<machine>/*.json   # bundles collected by the review leader
 ```
 
 Every proposal is marked `manual_approval_required`. Each one has a target, a route, the evidence line it came from, and a suggested action.
@@ -104,6 +109,24 @@ By default the excerpts are short and secret-shaped strings are masked, so the q
 Each run also records per-source parse statistics, and warns loudly (stderr, run metadata, and the packet itself) when a source's transcripts parse but yield zero tool calls — the signature of a transcript format change that would otherwise silently blind the loop.
 
 Proposals whose target was already flagged in previous runs are marked as recurring ("also flagged in N previous run(s)") and sorted to the top of the packet — a target that keeps coming back is the strongest signal the loop produces.
+
+## Fleet mode
+
+Run the scanner locally on every Mac so raw Claude, Codex, and Hermes session
+stores remain on the machine where they were created. Each ordinary scan writes
+one redacted proposal bundle under `fleet-outbox/<machine>/`; `--full` disables
+bundle output so unredacted evidence cannot enter the fleet handoff.
+
+Choose one review leader. Copy only the bundle JSON files into its
+`fleet-inbox/<machine>/` directories, then run:
+
+```sh
+agent-improvement-loop --collect-fleet \
+  --fleet-inbox ~/.agent-improvement/fleet-inbox
+```
+
+The resulting `*-fleet.md` packet carries machine provenance on every proposal.
+Do not run multiple review leaders against the same aggregate queue.
 
 ## Closing the loop / resolutions
 

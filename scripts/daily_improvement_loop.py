@@ -9,12 +9,16 @@ memory, runbooks, source code.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
 import os
 import re
 import shlex
+import socket
+import sqlite3
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -441,6 +445,7 @@ class Evidence:
     tool_name: str = ""
     command: str = ""
     occurred_at: str = ""
+    machine: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -452,6 +457,7 @@ class Evidence:
             "tool_name": self.tool_name,
             "command": self.command,
             "occurred_at": self.occurred_at,
+            "machine": self.machine,
             "excerpt": self.excerpt,
         }
 
@@ -475,6 +481,7 @@ class SessionSummary:
     cwd: str = ""
     started_at: str = ""
     ended_at: str = ""
+    machine: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
     pp_cli_invocations: Dict[str, List[Evidence]] = field(default_factory=dict)
     skill_invocations: Dict[str, List[Evidence]] = field(default_factory=dict)
@@ -501,6 +508,7 @@ class SessionSummary:
             "cwd": self.cwd,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
+            "machine": self.machine,
             "tool_call_count": len(self.tool_calls),
             "pp_cli_names": sorted(self.pp_cli_invocations),
             "skill_names": sorted(self.skill_invocations),
@@ -610,6 +618,7 @@ def evidence(
     tool_name: str = "",
     command: str = "",
     occurred_at: Any = "",
+    machine: str = "",
 ) -> Evidence:
     return Evidence(
         source=source,
@@ -621,7 +630,30 @@ def evidence(
         tool_name=tool_name,
         command=shorten(redact(command), 220),
         occurred_at=isoformat_utc(parsed) if (parsed := parse_time(occurred_at)) else "",
+        machine=machine,
     )
+
+
+def normalized_machine_name(value: str = "") -> str:
+    raw = (value or socket.gethostname()).split(".", 1)[0].strip().lower()
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-")
+    return slug or "unknown-machine"
+
+
+def stamp_session_machine(summary: SessionSummary, machine: str) -> None:
+    """Attach fleet provenance to a parsed session and every evidence item."""
+    summary.machine = machine
+    evidence_groups: List[Iterable[Evidence]] = [
+        summary.failures,
+        summary.silent_empty,
+        summary.corrections,
+    ]
+    evidence_groups.extend(summary.pp_cli_invocations.values())
+    evidence_groups.extend(summary.skill_invocations.values())
+    evidence_groups.extend(summary.slash_commands.values())
+    for group in evidence_groups:
+        for item in group:
+            item.machine = machine
 
 
 def jsonl_records(path: Path) -> Iterable[Tuple[int, Dict[str, Any]]]:
@@ -691,6 +723,12 @@ def is_transcript_scaffold(text: str, path: Optional[Path] = None) -> bool:
         "<scheduled-task",
         "compound codex tool mapping",
         "<task-notification>",
+        "[context compaction",
+        "[the user sent a text document",
+        "delivery:",
+        "# porter",
+        "# atlas",
+        "# athena",
         "## tracegrain runtime request",
         "weekly learnings harvest.",
         "monthly learnings review.",
@@ -1563,6 +1601,328 @@ def parse_codex_session(path: Path) -> SessionSummary:
     return summary
 
 
+def command_from_tool_payload(tool_name: str, payload: Any) -> str:
+    data = parse_json_maybe(payload)
+    if not data:
+        return ""
+    return str(data.get("command") or data.get("cmd") or "")
+
+
+def parse_hermes_messages(
+    *,
+    source: str,
+    path: Path,
+    profile: str,
+    session_id: str,
+    rows: Iterable[Tuple[int, str, str, str, str, Any]],
+    cwd: str = "",
+) -> SessionSummary:
+    """Normalize one Hermes SQLite session without treating prompts as corrections."""
+    summary = SessionSummary(source=source, path=path, session_id=session_id, cwd=cwd)
+    calls: Dict[str, ToolCall] = {}
+    seen_user_texts: set[str] = set()
+    agent_has_responded = False
+
+    for line_no, role, content, tool_calls_raw, tool_call_id, timestamp in rows:
+        parsed_time = parse_time(timestamp)
+        if parsed_time:
+            iso = isoformat_utc(parsed_time)
+            summary.started_at = summary.started_at or iso
+            summary.ended_at = iso
+        content = content or ""
+
+        if role in {"assistant", "tool"}:
+            agent_has_responded = True
+        if role == "user" and content:
+            for command in SLASH_COMMAND_RE.findall(content):
+                ev = evidence(
+                    source=source,
+                    path=path,
+                    line=line_no,
+                    kind="slash_command",
+                    text=f"/{command}",
+                    session_id=session_id,
+                    occurred_at=timestamp,
+                )
+                summary.slash_commands.setdefault(command, []).append(ev)
+            if (
+                agent_has_responded
+                and seen_user_texts
+                and content not in seen_user_texts
+                and is_user_correction_text(content, path)
+            ):
+                summary.corrections.append(
+                    evidence(
+                        source=source,
+                        path=path,
+                        line=line_no,
+                        kind="user_correction",
+                        text=content,
+                        session_id=session_id,
+                        occurred_at=timestamp,
+                    )
+                )
+            if not is_transcript_scaffold(content, path):
+                seen_user_texts.add(content)
+
+        if tool_calls_raw:
+            try:
+                parsed_calls = json.loads(tool_calls_raw)
+            except (json.JSONDecodeError, TypeError):
+                parsed_calls = []
+            if isinstance(parsed_calls, dict):
+                parsed_calls = [parsed_calls]
+            if isinstance(parsed_calls, list):
+                for index, item in enumerate(parsed_calls):
+                    if not isinstance(item, dict):
+                        continue
+                    fn_obj = item.get("function") if isinstance(item.get("function"), dict) else item
+                    fn = fn_obj if isinstance(fn_obj, dict) else {}
+                    name = str(fn.get("name") or item.get("name") or "")
+                    call_id = str(
+                        item.get("id")
+                        or item.get("call_id")
+                        or f"{session_id}:{line_no}:{index}"
+                    )
+                    arguments = fn.get("arguments") or item.get("arguments") or {}
+                    command = command_from_tool_payload(name, arguments)
+                    parsed_arguments = parse_json_maybe(arguments)
+                    skill = (
+                        str(parsed_arguments.get("skill") or parsed_arguments.get("name") or "")
+                        if name in {"skill_view", "skill_manage", "Skill"}
+                        else ""
+                    )
+                    clis = pp_cli_names(command)
+                    call = ToolCall(
+                        call_id=call_id,
+                        name=name,
+                        line=line_no,
+                        command=command,
+                        skill=skill,
+                        clis=clis,
+                        occurred_at=(isoformat_utc(parsed_time) if parsed_time else ""),
+                    )
+                    calls[call_id] = call
+                    summary.tool_calls.append(call)
+                    if skill:
+                        summary.skill_invocations.setdefault(skill, []).append(
+                            evidence(
+                                source=source,
+                                path=path,
+                                line=line_no,
+                                kind="skill_invocation",
+                                text=f"{name}({skill})",
+                                session_id=session_id,
+                                tool_name=name,
+                                occurred_at=timestamp,
+                            )
+                        )
+                    for cli in clis:
+                        add_pp_cli_evidence(
+                            summary,
+                            cli,
+                            evidence(
+                                source=source,
+                                path=path,
+                                line=line_no,
+                                kind="pp_cli_invocation",
+                                text=command,
+                                session_id=session_id,
+                                tool_name=name,
+                                command=command,
+                                occurred_at=timestamp,
+                            ),
+                        )
+
+        if role == "tool" and content:
+            call = calls.get(str(tool_call_id or ""))
+            if call and tool_result_is_failure(call, content, None):
+                ev = evidence(
+                    source=source,
+                    path=path,
+                    line=line_no,
+                    kind="tool_failure",
+                    text=content,
+                    session_id=session_id,
+                    tool_name=call.name,
+                    command=call.command,
+                    occurred_at=timestamp,
+                )
+                summary.failures.append(ev)
+                for cli in pp_cli_failures_for_output(
+                    call.command,
+                    content,
+                    call.clis,
+                    confirmed_failure=True,
+                ):
+                    add_pp_cli_evidence(summary, cli, ev)
+            elif call:
+                capture_pp_cli_hang(
+                    summary,
+                    source,
+                    path,
+                    line_no,
+                    call.command,
+                    content,
+                    call.clis,
+                    timestamp,
+                )
+
+    if profile:
+        summary.cwd = summary.cwd or f"profile:{profile}"
+    return summary
+
+
+def hermes_profile_name(db_path: Path, home: Path) -> str:
+    try:
+        relative = db_path.relative_to(home / ".hermes" / "profiles")
+        return relative.parts[0]
+    except ValueError:
+        return "default"
+
+
+def discover_hermes_profile_dbs(home: Path) -> List[Path]:
+    dbs: List[Path] = []
+    default_db = home / ".hermes" / "state.db"
+    if default_db.exists():
+        dbs.append(default_db)
+    profiles_root = home / ".hermes" / "profiles"
+    if profiles_root.exists():
+        for profile_dir in sorted(item for item in profiles_root.iterdir() if item.is_dir()):
+            db_path = profile_dir / "state.db"
+            if db_path.exists():
+                dbs.append(db_path)
+    return dbs
+
+
+def parse_hermes_profile_db(
+    db_path: Path,
+    *,
+    home: Optional[Path] = None,
+    since: Optional[dt.datetime] = None,
+    max_sessions: int = 0,
+) -> List[SessionSummary]:
+    home = home or Path.home()
+    profile = hermes_profile_name(db_path, home)
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        since_timestamp = since.timestamp() if since else 0
+        session_rows = connection.execute(
+            "select id, coalesce(cwd,''), started_at, "
+            "coalesce(ended_at, started_at), source from sessions "
+            "where coalesce(ended_at, started_at) >= ? "
+            "order by coalesce(ended_at, started_at)",
+            (since_timestamp,),
+        ).fetchall()
+        if max_sessions:
+            session_rows = session_rows[-max_sessions:]
+        summaries: List[SessionSummary] = []
+        for session_id, cwd, _started, _ended, _session_source in session_rows:
+            rows = connection.execute(
+                "select id, role, coalesce(content,''), coalesce(tool_calls,''), "
+                "coalesce(tool_call_id,''), timestamp from messages "
+                "where session_id=? and active=1 order by id",
+                (session_id,),
+            ).fetchall()
+            summary = parse_hermes_messages(
+                source="hermes_profile_log",
+                path=db_path,
+                profile=profile,
+                session_id=str(session_id),
+                rows=rows,
+                cwd=str(cwd or f"profile:{profile}"),
+            )
+            if summary.has_signal():
+                summaries.append(summary)
+        return summaries
+    finally:
+        connection.close()
+
+
+def parse_paperclip_event_rows(
+    rows: Iterable[Tuple[str, str, str, str, str, str, str, str]]
+) -> List[SessionSummary]:
+    grouped: Dict[str, List[Tuple[int, str, str, str, str, Any]]] = {}
+    metadata: Dict[str, Dict[str, str]] = {}
+    for run_id, agent_name, adapter_type, session_id, log_ref, seq, stream, message in rows:
+        sid = session_id or run_id
+        path = Path(f"paperclip://{log_ref or run_id}")
+        metadata[sid] = {
+            "path": str(path),
+            "agent": agent_name or "",
+            "adapter": adapter_type or "",
+        }
+        text = message or ""
+        role = "tool" if stream in {"stdout", "stderr", "system"} else "assistant"
+        grouped.setdefault(sid, []).append((int(seq or 0), role, text, "", "", ""))
+
+    summaries: List[SessionSummary] = []
+    for sid, items in grouped.items():
+        item_metadata = metadata[sid]
+        summary = parse_hermes_messages(
+            source="paperclip_run",
+            path=Path(item_metadata["path"]),
+            profile=item_metadata["agent"],
+            session_id=sid,
+            rows=sorted(items),
+            cwd=f"paperclip:{item_metadata['agent']}:{item_metadata['adapter']}",
+        )
+        if summary.has_signal():
+            summaries.append(summary)
+    return summaries
+
+
+def discover_paperclip_runs(
+    args: argparse.Namespace, since: Optional[dt.datetime]
+) -> List[SessionSummary]:
+    db_url = getattr(args, "paperclip_db_url", None) or os.environ.get(
+        "PAPERCLIP_DATABASE_URL"
+    )
+    company_id = getattr(args, "paperclip_company_id", "")
+    if not db_url or not company_id:
+        return []
+    if re.search(r"postgres(?:ql)?://[^/@:]+:[^/@]+@", db_url):
+        print(
+            "warning: refusing Paperclip URL with inline password; use PGPASSWORD or a service file",
+            file=sys.stderr,
+        )
+        return []
+    since_sql = (
+        since or (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1))
+    ).isoformat()
+    query = """
+select h.id::text, a.name, a.adapter_type,
+       coalesce(h.session_id_after,h.session_id_before,''), coalesce(h.log_ref,''),
+       e.seq::text, coalesce(e.stream,''), coalesce(e.message,'')
+from heartbeat_runs h
+join agents a on a.id=h.agent_id
+left join heartbeat_run_events e on e.run_id=h.id
+where h.company_id='{}' and h.started_at >= '{}'
+order by h.started_at, e.seq
+""".format(company_id.replace("'", "''"), since_sql.replace("'", "''"))
+    try:
+        process = subprocess.run(
+            ["psql", db_url, "-F", "\t", "-Atc", query],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        print(
+            f"warning: failed to query Paperclip runs: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return []
+    rows = []
+    for line in process.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 8 and parts[7]:
+            rows.append(tuple(parts))
+    return parse_paperclip_event_rows(rows)
+
+
 def discover_claude_sessions(home: Path) -> List[Path]:
     root = home / ".claude" / "projects"
     if not root.exists():
@@ -1612,7 +1972,7 @@ def proposal_key(route: str, target_kind: str, target_name: str, evidence_items:
     h.update(target_name.encode())
     for ev in evidence_items:
         h.update(b"\0")
-        h.update(f"{ev.source}:{ev.path}:{ev.line}:{ev.kind}".encode())
+        h.update(f"{ev.machine}:{ev.source}:{ev.path}:{ev.line}:{ev.kind}".encode())
     return h.hexdigest()[:20]
 
 
@@ -1630,6 +1990,7 @@ def make_proposal(
     key = proposal_key(route, target_kind, target_name, evidence_items)
     created_at = utc_now()
     latest = latest_evidence_time(evidence_items)
+    machines = sorted({ev.machine for ev in evidence_items if ev.machine})
     return {
         "schema_version": SCHEMA_VERSION,
         "proposal_id": f"imp-{key}",
@@ -1642,6 +2003,7 @@ def make_proposal(
         "summary": summary,
         "impact": impact,
         "target": {"kind": target_kind, "name": target_name},
+        "machines": machines,
         "evidence": [ev.as_dict() for ev in evidence_items[:12]],
         "suggested_action": suggested_action,
         "apply_policy": {
@@ -1657,7 +2019,7 @@ def content_proposal_key(title: str, evidence_items: List[Evidence]) -> str:
     h.update(title.encode())
     for ev in evidence_items:
         h.update(b"\0")
-        h.update(f"{ev.source}:{ev.path}:{ev.line}:{ev.kind}".encode())
+        h.update(f"{ev.machine}:{ev.source}:{ev.path}:{ev.line}:{ev.kind}".encode())
     return h.hexdigest()[:20]
 
 
@@ -1700,6 +2062,7 @@ def content_evidence_dicts(evidence_items: List[Evidence], privacy: Dict[str, An
                 "tool_name": ev.tool_name,
                 "command": "<private workflow evidence redacted>",
                 "occurred_at": ev.occurred_at,
+                "machine": ev.machine,
                 "excerpt": "<private workflow evidence redacted>",
             }
             for ev in evidence_items[:12]
@@ -1725,6 +2088,7 @@ def make_content_proposal(
     privacy = privacy_for_content(evidence_items)
     created_at = utc_now()
     latest = latest_evidence_time(evidence_items)
+    machines = sorted({ev.machine for ev in evidence_items if ev.machine})
     if privacy["risk_level"] == "high" and recommendation == "write_now":
         recommendation = "needs_context"
         confidence = min(confidence, 0.72)
@@ -1742,6 +2106,7 @@ def make_content_proposal(
         "confidence": round(confidence, 2),
         "summary": real_workflow_or_moment,
         "target": {"kind": "content_angle", "name": title},
+        "machines": machines,
         "trigger": {
             "kind": trigger_kind,
             "real_workflow_or_moment": real_workflow_or_moment,
@@ -1794,6 +2159,7 @@ def workflow_evidence_from_tool_call(session: SessionSummary, call: ToolCall) ->
         tool_name=call.name,
         command=call.command,
         occurred_at=call.occurred_at,
+        machine=session.machine,
     )
 
 
@@ -1984,6 +2350,7 @@ def generate_aggregate_content_proposals(
                         session_id=str(ev.get("session_id", "")),
                         tool_name=str(ev.get("tool_name", "")),
                         command=str(ev.get("command", "")),
+                        machine=str(ev.get("machine", "")),
                     )
                 )
         labels = list(dict.fromkeys(labels))
@@ -2453,9 +2820,33 @@ def first_executable(command: str) -> str:
     parts = command.strip().split()
     if not parts:
         return ""
+    shell_fragments = {
+        "#",
+        "case",
+        "do",
+        "done",
+        "else",
+        "esac",
+        "fi",
+        "for",
+        "function",
+        "if",
+        "in",
+        "then",
+        "while",
+        "}",
+    }
+    first = parts[0]
+    if (
+        first in shell_fragments
+        or first.startswith(("#", "}", ")"))
+        or first.endswith((")", "}", ";;"))
+        or "$(" in first
+    ):
+        return ""
+    if ENV_ASSIGNMENT_RE.match(first):
+        return parts[1] if len(parts) > 1 else ""
     if parts[0] in {"env", "command", "time"} and len(parts) > 1:
-        return parts[1]
-    if "=" in parts[0] and len(parts) > 1:
         return parts[1]
     return Path(parts[0]).name
 
@@ -2763,10 +3154,21 @@ def write_review_packet(
     parser_warnings: Optional[List[str]] = None,
     resolution_suppressed: Optional[List[Dict[str, Any]]] = None,
     regressions: Optional[List[Dict[str, Any]]] = None,
+    fleet_sources: Optional[List[Dict[str, Any]]] = None,
 ) -> Path:
     path = root / "review-packets" / f"{run_id}.md"
     resolution_suppressed = resolution_suppressed or []
     regressions = regressions or []
+    fleet_sources = fleet_sources or []
+    session_count = (
+        sum(int(item.get("sessions_with_signals", 0)) for item in fleet_sources)
+        if fleet_sources
+        else len(sessions)
+    )
+    machines = sorted(
+        {str(item.get("machine")) for item in fleet_sources if item.get("machine")}
+        or {session.machine for session in sessions if session.machine}
+    )
     suppressed_targets = sorted({item["target"] for item in resolution_suppressed})
     target_text = ", ".join(f"`{target}`" for target in suppressed_targets) or "none"
     lines = [
@@ -2788,7 +3190,8 @@ def write_review_packet(
         "",
         "## Summary",
         "",
-        f"- Sessions with signals: {len(sessions)}",
+        f"- Machines: {', '.join(machines) or 'unknown'}",
+        f"- Sessions with signals: {session_count}",
         f"- Proposals staged this run: {len(proposals)}",
         (
             f"- {len(resolution_suppressed)} proposals suppressed as already-resolved "
@@ -2827,7 +3230,8 @@ def write_review_packet(
         for ev in proposal["evidence"][:8]:
             loc = f"{ev['path']}:{ev['line']}"
             cmd = f" command=`{ev['command']}`" if ev.get("command") else ""
-            lines.append(f"  - `{ev['kind']}` {loc}{cmd} - {ev['excerpt']}")
+            machine = f" [{ev['machine']}]" if ev.get("machine") else ""
+            lines.append(f"  - `{ev['kind']}`{machine} {loc}{cmd} - {ev['excerpt']}")
         lines.append("")
 
     if any(proposal.get("route") == "content_idea" for proposal in proposals):
@@ -2840,11 +3244,21 @@ def write_review_packet(
             ]
         )
 
+    if fleet_sources:
+        lines.extend(["## Fleet Sources", ""])
+        for item in fleet_sources:
+            lines.append(
+                f"- `{item.get('machine', 'unknown')}` run=`{item.get('run_id', '')}` "
+                f"sessions={item.get('sessions_with_signals', 0)} "
+                f"proposals={item.get('proposal_count', 0)}"
+            )
+        lines.append("")
+
     lines.extend(["## Session Index", ""])
     for session in sessions[:200]:
         data = session.as_dict()
         lines.append(
-            f"- `{data['source']}` `{data['session_id']}` "
+            f"- `{data['machine'] or 'unknown'}` `{data['source']}` `{data['session_id']}` "
             f"tools={data['tool_call_count']} pp={','.join(data['pp_cli_names']) or '-'} "
             f"skills={','.join(data['skill_names']) or '-'} failures={data['failure_count']} "
             f"corrections={data['correction_count']}"
@@ -2852,6 +3266,130 @@ def write_review_packet(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return path
+
+
+def write_fleet_bundle(
+    root: Path,
+    run_id: str,
+    machine: str,
+    result: Dict[str, Any],
+    proposals: List[Dict[str, Any]],
+) -> Optional[Path]:
+    """Write a redacted, self-contained handoff without copying transcripts."""
+    if FULL_DETAIL:
+        print("warning: --full disables fleet bundle output", file=sys.stderr)
+        return None
+    bundle = {
+        "schema_version": SCHEMA_VERSION,
+        "bundle_kind": "agent_improvement_redacted_proposals",
+        "redacted": True,
+        "machine": machine,
+        "run_id": run_id,
+        "started_at": result.get("started_at"),
+        "files_scanned": result.get("files_scanned", 0),
+        "sessions_with_signals": result.get("sessions_with_signals", 0),
+        "proposal_count": len(proposals),
+        "parser_warnings": result.get("parser_warnings", []),
+        "proposals": proposals,
+    }
+    path = root / "fleet-outbox" / machine / f"{run_id}.json"
+    write_json(path, bundle)
+    return path
+
+
+def collect_fleet_bundles(args: argparse.Namespace) -> int:
+    """Merge the latest redacted bundle per Mac into one orchestrator packet."""
+    root = Path(args.output_root).expanduser()
+    inbox = Path(args.fleet_inbox).expanduser()
+    latest_by_machine: Dict[str, Dict[str, Any]] = {}
+    for path in sorted(inbox.glob("*/*.json")):
+        try:
+            bundle = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"warning: skipped invalid fleet bundle {path}: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(bundle, dict) or bundle.get("redacted") is not True:
+            print(f"warning: skipped non-redacted fleet bundle {path}", file=sys.stderr)
+            continue
+        machine = normalized_machine_name(str(bundle.get("machine") or path.parent.name))
+        run_id = str(bundle.get("run_id") or "")
+        if not run_id:
+            continue
+        current = latest_by_machine.get(machine)
+        if current is None or run_id > str(current.get("run_id") or ""):
+            latest_by_machine[machine] = bundle
+
+    if not latest_by_machine:
+        print(f"error: no valid redacted fleet bundles under {inbox}", file=sys.stderr)
+        return 2
+
+    fleet_sources: List[Dict[str, Any]] = []
+    proposals: List[Dict[str, Any]] = []
+    parser_warnings: List[str] = []
+    for machine, bundle in sorted(latest_by_machine.items()):
+        bundle_proposals = bundle.get("proposals")
+        if not isinstance(bundle_proposals, list):
+            bundle_proposals = []
+        fleet_sources.append(
+            {
+                "machine": machine,
+                "run_id": str(bundle.get("run_id") or ""),
+                "sessions_with_signals": int(bundle.get("sessions_with_signals") or 0),
+                "proposal_count": len(bundle_proposals),
+            }
+        )
+        parser_warnings.extend(
+            f"{machine}: {warning}" for warning in bundle.get("parser_warnings", [])
+        )
+        for original in bundle_proposals:
+            if not isinstance(original, dict):
+                continue
+            proposal = copy.deepcopy(original)
+            origin_id = str(proposal.get("proposal_id") or "")
+            proposal["origin_proposal_id"] = origin_id
+            proposal["proposal_id"] = f"{machine}-{origin_id}"
+            proposal["proposal_key"] = hashlib.sha256(
+                f"{machine}:{proposal.get('proposal_key', origin_id)}".encode()
+            ).hexdigest()[:20]
+            proposal["machines"] = [machine]
+            for item in proposal.get("evidence", []):
+                if isinstance(item, dict):
+                    item["machine"] = machine
+            proposals.append(proposal)
+
+    fleet_run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-fleet")
+    proposal_dir = root / "proposals" / fleet_run_id
+    for proposal in proposals:
+        write_json(proposal_dir / f"{proposal['proposal_id']}.json", proposal)
+    packet_path = write_review_packet(
+        root,
+        fleet_run_id,
+        [],
+        proposals,
+        parser_warnings,
+        fleet_sources=fleet_sources,
+    )
+    run_result = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": fleet_run_id,
+        "started_at": utc_now(),
+        "source": "fleet_redacted_bundles",
+        "machines": [item["machine"] for item in fleet_sources],
+        "sessions_with_signals": sum(
+            item["sessions_with_signals"] for item in fleet_sources
+        ),
+        "proposal_count": len(proposals),
+        "fleet_sources": fleet_sources,
+        "review_packet": str(packet_path),
+    }
+    write_json(root / "runs" / f"{fleet_run_id}.json", run_result)
+    print(
+        f"fleet_machines={','.join(run_result['machines'])} "
+        f"sessions_with_signals={run_result['sessions_with_signals']} "
+        f"proposals={len(proposals)}"
+    )
+    print(f"review_packet={packet_path}")
+    return 0
 
 
 TARGET_HISTORY_KEEP = 10
@@ -2997,6 +3535,7 @@ def scan(args: argparse.Namespace) -> int:
     FULL_DETAIL = bool(getattr(args, "full", False))
     home = Path(args.home).expanduser()
     homes = [home] + [Path(item).expanduser() for item in getattr(args, "extra_home", [])]
+    machine = normalized_machine_name(getattr(args, "machine", ""))
     root = Path(args.output_root).expanduser()
     config_path = Path(getattr(args, "config", "") or DEFAULT_CONFIG_PATH).expanduser()
     apply_config(load_config(config_path))
@@ -3027,7 +3566,56 @@ def scan(args: argparse.Namespace) -> int:
         stats["files"] += 1
         stats["tool_calls"] += len(parsed.tool_calls)
         if parsed.has_signal():
+            stamp_session_machine(parsed, machine)
             sessions.append(parsed)
+
+    hermes_db_count = 0
+    if args.source in {"all", "hermes_profile_log"}:
+        seen_dbs: set[Path] = set()
+        for scan_home in homes:
+            for db_path in discover_hermes_profile_dbs(scan_home):
+                resolved = db_path.resolve()
+                if resolved in seen_dbs:
+                    continue
+                seen_dbs.add(resolved)
+                hermes_db_count += 1
+                try:
+                    parsed_sessions = parse_hermes_profile_db(
+                        db_path,
+                        home=scan_home,
+                        since=since,
+                        max_sessions=(
+                            args.max_sessions if args.source == "hermes_profile_log" else 0
+                        ),
+                    )
+                except Exception as exc:
+                    print(f"warning: failed to parse Hermes profile DB {db_path}: {exc}", file=sys.stderr)
+                    continue
+                stats = parse_stats.setdefault(
+                    "hermes_profile_log", {"files": 0, "tool_calls": 0}
+                )
+                stats["files"] += 1
+                stats["tool_calls"] += sum(len(item.tool_calls) for item in parsed_sessions)
+                for item in parsed_sessions:
+                    stamp_session_machine(item, machine)
+                sessions.extend(parsed_sessions)
+
+    paperclip_source_count = 0
+    if args.source in {"all", "paperclip_run"}:
+        paperclip_sessions = discover_paperclip_runs(args, since)
+        if paperclip_sessions:
+            paperclip_source_count = 1
+            stats = parse_stats.setdefault("paperclip_run", {"files": 0, "tool_calls": 0})
+            stats["files"] = 1
+            stats["tool_calls"] += sum(len(item.tool_calls) for item in paperclip_sessions)
+            for item in paperclip_sessions:
+                stamp_session_machine(item, machine)
+            sessions.extend(paperclip_sessions)
+
+    if args.max_sessions:
+        sessions = sorted(
+            sessions, key=lambda item: item.ended_at or item.started_at
+        )[-args.max_sessions :]
     parser_warnings = parser_health_warnings(parse_stats)
     for warning in parser_warnings:
         print(f"warning: {warning}", file=sys.stderr)
@@ -3055,8 +3643,9 @@ def scan(args: argparse.Namespace) -> int:
         "run_id": run_id,
         "started_at": utc_now(),
         "source": args.source,
+        "machine": machine,
         "since": since.isoformat() if since else None,
-        "files_scanned": len(files),
+        "files_scanned": len(files) + hermes_db_count + paperclip_source_count,
         "sessions_with_signals": len(sessions),
         "proposal_count": len(proposals),
         "resolved_suppressed_count": len(filtered.suppressed),
@@ -3102,13 +3691,19 @@ def scan(args: argparse.Namespace) -> int:
     state["seen_proposal_keys"] = sorted(seen)
     write_json(root / "state.json", state)
     write_json(root / "runs" / f"{run_id}.json", {**result, "review_packet": str(packet_path)})
+    bundle_path = write_fleet_bundle(root, run_id, machine, result, proposals)
 
-    print(f"scanned={len(files)} sessions_with_signals={len(sessions)} proposals={len(proposals)}")
+    print(
+        f"machine={machine} scanned={result['files_scanned']} "
+        f"sessions_with_signals={len(sessions)} proposals={len(proposals)}"
+    )
     print(
         f"resolved_suppressed={len(filtered.suppressed)} "
         f"targets={','.join(suppressed_targets) or '-'} regressions={len(filtered.regressions)}"
     )
     print(f"review_packet={packet_path}")
+    if bundle_path:
+        print(f"fleet_bundle={bundle_path}")
     if proposals:
         print(f"proposal_dir={proposal_dir}")
     return 0
@@ -3118,6 +3713,8 @@ def manage_resolutions(args: argparse.Namespace) -> int:
     root = Path(args.output_root).expanduser()
     actor = str(args.by or os.environ.get("USER") or "unknown")
     try:
+        if args.collect_fleet:
+            return collect_fleet_bundles(args)
         if args.list_resolutions:
             print(json.dumps(load_resolutions(root), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
@@ -3167,7 +3764,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional home directory containing .claude/.codex logs, e.g. logs copied from another machine over ssh",
     )
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Proposal queue root")
-    parser.add_argument("--source", choices=["all", "claude", "codex"], default="all")
+    parser.add_argument(
+        "--source",
+        choices=["all", "claude", "codex", "hermes_profile_log", "paperclip_run"],
+        default="all",
+    )
+    parser.add_argument(
+        "--machine",
+        default="",
+        help="Stable fleet machine name embedded in sessions, proposals, and redacted bundles",
+    )
     parser.add_argument(
         "--route",
         choices=["all", "improvement", "content_idea"],
@@ -3200,12 +3806,32 @@ def build_parser() -> argparse.ArgumentParser:
             "silent_empty_fetch_verbs, silent_empty_ignore)"
         ),
     )
+    parser.add_argument(
+        "--paperclip-db-url",
+        default=os.environ.get("PAPERCLIP_DATABASE_URL", ""),
+        help="Optional Paperclip Postgres URL; keep passwords in PGPASSWORD or a service file",
+    )
+    parser.add_argument(
+        "--paperclip-company-id",
+        default=os.environ.get("PAPERCLIP_COMPANY_ID", ""),
+        help="Optional Paperclip company UUID when the selected source includes Paperclip",
+    )
+    parser.add_argument(
+        "--fleet-inbox",
+        default=str(DEFAULT_OUTPUT_ROOT / "fleet-inbox"),
+        help="Root containing <machine>/<run-id>.json redacted fleet bundles",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print JSON and do not write queue files")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--resolve", metavar="ROUTE:TARGET", help="Record a target resolution")
     actions.add_argument("--resolve-from", metavar="PATH", help="Import structured decisions JSON")
     actions.add_argument("--list-resolutions", action="store_true", help="Print the resolutions registry")
     actions.add_argument("--unresolve", metavar="ROUTE:TARGET", help="Remove a target resolution")
+    actions.add_argument(
+        "--collect-fleet",
+        action="store_true",
+        help="Merge the latest redacted bundle per machine into one fleet review packet",
+    )
     parser.add_argument("--decision", choices=sorted(RESOLUTION_DECISIONS), help="Resolution decision")
     parser.add_argument("--resolved-at", help="Resolution watermark (ISO8601 UTC; default now)")
     parser.add_argument("--pr", help="Fix PR number or URL")
