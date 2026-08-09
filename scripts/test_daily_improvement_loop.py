@@ -2795,6 +2795,90 @@ class ResolutionTests(unittest.TestCase):
             self.assertIn("silverfox-imp-", packet)
             self.assertIn("studio-imp-", packet)
 
+    def test_fleet_boundary_recursively_redacts_tool_output_secrets(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            leaked = "pcp_" + "a" * 48
+            proposal = {
+                "proposal_id": "imp-secret",
+                "evidence": [
+                    {
+                        "command": "paperclip issue get --api-key <redacted-secret>",
+                        "excerpt": json.dumps(
+                            {"output": f'argv: ["--api-key", "{leaked}"]'}
+                        ),
+                    }
+                ],
+            }
+
+            path = loop.write_fleet_bundle(
+                root,
+                "20260809T000000Z",
+                "knox",
+                {"started_at": "2026-08-09T00:00:00Z", "parser_warnings": []},
+                [proposal],
+            )
+
+            self.assertIsNotNone(path)
+            serialized = path.read_text(encoding="utf-8")
+            self.assertNotIn(leaked, serialized)
+            self.assertIn("<redacted-paperclip-key>", serialized)
+
+    def test_fleet_collector_resanitizes_a_peer_bundle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "queue"
+            leaked = "pcp_" + "b" * 48
+            proposal = loop.make_proposal(
+                route="tool",
+                title="Review demo CLI",
+                summary="One failure",
+                target_kind="tool",
+                target_name="demo-pp-cli",
+                evidence_items=[
+                    loop.Evidence(
+                        source="hermes_profile_log",
+                        path="/Users/test/state.db",
+                        line=1,
+                        kind="tool_failure",
+                        excerpt=f"tool output: {leaked}",
+                        machine="knox",
+                    )
+                ],
+                suggested_action="Review",
+                impact=["Retry"],
+            )
+            loop.write_json(
+                root / "fleet-inbox" / "knox" / "20260809T010000Z.json",
+                {
+                    "schema_version": 1,
+                    "redacted": True,
+                    "machine": "knox",
+                    "run_id": "20260809T010000Z",
+                    "sessions_with_signals": 1,
+                    "proposals": [proposal],
+                },
+            )
+
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    loop.main(
+                        [
+                            "--output-root",
+                            str(root),
+                            "--fleet-inbox",
+                            str(root / "fleet-inbox"),
+                            "--collect-fleet",
+                        ]
+                    ),
+                    0,
+                )
+
+            packet = next((root / "review-packets").glob("*-fleet.md")).read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(leaked, packet)
+            self.assertIn("<redacted-paperclip-key>", packet)
+
 
 if __name__ == "__main__":
     unittest.main()

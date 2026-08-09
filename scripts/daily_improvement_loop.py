@@ -402,6 +402,7 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"), "<redacted-gitlab-token>"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "<redacted-github-token>"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "<redacted-github-token>"),
+    (re.compile(r"\bpcp_[A-Za-z0-9]{20,}\b"), "<redacted-paperclip-key>"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b"), "<redacted-jwt>"),
     (re.compile(r"(?<!\w)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\w)"), "<phone>"),
     (
@@ -605,6 +606,27 @@ def redact(text: str) -> str:
     for pattern, replacement in SECRET_PATTERNS:
         out = pattern.sub(replacement, out)
     return out
+
+
+def redact_for_fleet(text: str) -> str:
+    """Always redact a fleet-bound string, even when local --full mode is set."""
+    out = text or ""
+    for pattern, replacement in SECRET_PATTERNS:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+def redact_structure_for_fleet(value: Any) -> Any:
+    """Recursively sanitize every string crossing a machine boundary."""
+    if isinstance(value, str):
+        return redact_for_fleet(value)
+    if isinstance(value, dict):
+        return {key: redact_structure_for_fleet(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_structure_for_fleet(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_structure_for_fleet(item) for item in value]
+    return value
 
 
 def evidence(
@@ -3289,8 +3311,8 @@ def write_fleet_bundle(
         "files_scanned": result.get("files_scanned", 0),
         "sessions_with_signals": result.get("sessions_with_signals", 0),
         "proposal_count": len(proposals),
-        "parser_warnings": result.get("parser_warnings", []),
-        "proposals": proposals,
+        "parser_warnings": redact_structure_for_fleet(result.get("parser_warnings", [])),
+        "proposals": redact_structure_for_fleet(proposals),
     }
     path = root / "fleet-outbox" / machine / f"{run_id}.json"
     write_json(path, bundle)
@@ -3311,6 +3333,10 @@ def collect_fleet_bundles(args: argparse.Namespace) -> int:
         if not isinstance(bundle, dict) or bundle.get("redacted") is not True:
             print(f"warning: skipped non-redacted fleet bundle {path}", file=sys.stderr)
             continue
+        # Treat peer bundles as untrusted input. Re-sanitize every string even
+        # when the producer marked the bundle redacted so an older scanner or
+        # a missed evidence field cannot leak credentials into the fleet packet.
+        bundle = redact_structure_for_fleet(bundle)
         machine = normalized_machine_name(str(bundle.get("machine") or path.parent.name))
         run_id = str(bundle.get("run_id") or "")
         if not run_id:
