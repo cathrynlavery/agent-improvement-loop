@@ -30,4 +30,3 @@ printf '=== %s machine=%s ===\n%s\n' "$NOW" "$MACHINE" "$scan_output" >> "$DETAI
 summary="$(printf '%s\n' "$scan_output" | grep -E '^(machine=|review_packet=|fleet_bundle=)' | tr '\n' ' ')"
 printf 'RUN %s machine=%s exit=%s %s\n' "$NOW" "$MACHINE" "$scan_exit" "${summary:-no-summary}" >> "$RUN_LOG"
 exit "$scan_exit"
-

@@ -2705,17 +2705,17 @@ class ResolutionTests(unittest.TestCase):
             session_id="h1",
             rows=rows,
         )
-        loop.stamp_session_machine(summary, "silverfox")
+        loop.stamp_session_machine(summary, "desktop")
         self.assertEqual(len(summary.corrections), 1)
-        self.assertEqual(summary.corrections[0].machine, "silverfox")
+        self.assertEqual(summary.corrections[0].machine, "desktop")
         self.assertEqual(sorted(summary.pp_cli_invocations), ["shopify-pp-cli"])
         proposal = next(
             item
             for item in loop.generate_proposals([summary])
             if item["target"]["name"] == "shopify-pp-cli"
         )
-        self.assertEqual(proposal["machines"], ["silverfox"])
-        self.assertTrue(all(item["machine"] == "silverfox" for item in proposal["evidence"]))
+        self.assertEqual(proposal["machines"], ["desktop"])
+        self.assertTrue(all(item["machine"] == "desktop" for item in proposal["evidence"]))
 
     def test_backlog_executable_rejects_shell_fragments(self):
         for command in (
@@ -2735,8 +2735,8 @@ class ResolutionTests(unittest.TestCase):
             root = Path(td) / "queue"
             inbox = root / "fleet-inbox"
             for machine, run_id in (
-                ("silverfox", "20260809T100000Z"),
-                ("studio", "20260809T100100Z"),
+                ("desktop", "20260809T100000Z"),
+                ("laptop", "20260809T100100Z"),
             ):
                 ev = loop.Evidence(
                     source="codex",
@@ -2791,9 +2791,9 @@ class ResolutionTests(unittest.TestCase):
                 )
             )
             packet = packet_path.read_text(encoding="utf-8")
-            self.assertIn("Machines: silverfox, studio", packet)
-            self.assertIn("silverfox-imp-", packet)
-            self.assertIn("studio-imp-", packet)
+            self.assertIn("Machines: desktop, laptop", packet)
+            self.assertIn("desktop-imp-", packet)
+            self.assertIn("laptop-imp-", packet)
 
     def test_fleet_boundary_recursively_redacts_tool_output_secrets(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2814,7 +2814,7 @@ class ResolutionTests(unittest.TestCase):
             path = loop.write_fleet_bundle(
                 root,
                 "20260809T000000Z",
-                "knox",
+                "server",
                 {"started_at": "2026-08-09T00:00:00Z", "parser_warnings": []},
                 [proposal],
             )
@@ -2831,7 +2831,7 @@ class ResolutionTests(unittest.TestCase):
             line=1,
             kind="tool_failure",
             excerpt="Error: unknown flag",
-            machine="silverfox",
+            machine="desktop",
         )
         proposal = loop.make_proposal(
             route="tool",
@@ -2869,18 +2869,18 @@ class ResolutionTests(unittest.TestCase):
                         line=1,
                         kind="tool_failure",
                         excerpt=f"tool output: {leaked}",
-                        machine="knox",
+                        machine="server",
                     )
                 ],
                 suggested_action="Review",
                 impact=["Retry"],
             )
             loop.write_json(
-                root / "fleet-inbox" / "knox" / "20260809T010000Z.json",
+                root / "fleet-inbox" / "server" / "20260809T010000Z.json",
                 {
                     "schema_version": 1,
                     "redacted": True,
-                    "machine": "knox",
+                    "machine": "server",
                     "run_id": "20260809T010000Z",
                     "sessions_with_signals": 1,
                     "proposals": [proposal],

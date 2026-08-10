@@ -14,8 +14,9 @@ INSTRUCTION = (
     "or you discover a better approach, read `~/.agents/learnings/config.json` and "
     "create a machine-prefixed `LRN`, `ERR`, or `FEAT` file under "
     "`~/.agents/learnings/entries/<machine>/` in self-improving-agent format. "
-    "Search local entries and `fleet/catalog.json` first. Never append to aggregates; "
-    "never log secrets."
+    "Use `learnings new-id --type <TYPE>` when available so the logical ID includes "
+    "a machine token and high-entropy suffix. Search local entries and "
+    "`fleet/catalog.json` first. Never append to aggregates; never log secrets."
 )
 INSTRUCTION_RE = re.compile(r"^- Self-improvement:.*$", re.M)
 

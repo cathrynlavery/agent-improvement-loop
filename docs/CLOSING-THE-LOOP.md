@@ -15,16 +15,16 @@ The miner in this repo is the *capture* half of a self-improvement system: it re
 | **Capture** | continuous | every agent session | log errors/corrections locally, one machine-prefixed file per entry, mandatory `**Status**` field |
 | **Harvest** | weekly | headless scheduled run | mine transcripts for learnings that in-session logging missed (this repo's miner) |
 | **Fixloop** | daily | headless scheduled run, **no shell access** | triage new entries: promote safe rules, resolve knowledge notes, queue real work into `FIX-QUEUE.md` (`templates/fixloop-prompt.md`) |
-| **Learn-loop** | on demand | interactive session with a human | execute the queue: plan → approve → fix → verify → close statuses (`skills/learn-loop/SKILL.md`) |
+| **Learn-loop** | on demand | interactive session with a human | execute the queue: plan → approve → fix → verify → record decisions (`skills/learn-loop/SKILL.md`) |
 
 The split matters: the daily pass has no shell, so it can never push code or touch credentials unattended — the expensive, risky work always lands in the queue for a human-supervised session.
 
 ## Design rules that earned their place
 
 1. **Log a line even on an empty run.** A scheduler that only logs when it finds something is indistinguishable from a dead scheduler. (Found: a "weekly" harvest that had run twice in 13 days, and a git backup dead for six weeks that nobody noticed.)
-2. **Every entry carries a Status, and closing statuses is a required step, not a courtesy.** Unclosed entries are how a 150-entry backlog accumulates. When a fix ships, the entry gets a Resolution line with the commit/PR; when a rule is promoted, the entry says where.
+2. **Every entry carries a captured Status, and recording the fleet outcome is required, not a courtesy.** Unclosed entries are how a 150-entry backlog accumulates. Evidence stays immutable; the leader records the effective status, commit/PR, and verification in `decisions/<ID>.json`.
 3. **Dead-man checks are alert-only.** A freshness monitor that also "repairs" things becomes a second actor racing the first. Alert; let a human or the interactive loop decide.
-4. **Stale-lock protocol.** A 0-byte `.git/index.lock` under a *running* git process is normal mid-operation state — removing it corrupts live work. Check for a live process first; only remove orphaned locks.
+4. **Stale-lock protocol applies only to a source repository being fixed.** The machine-local store is not assumed to be a Git repository. In a source repo, a 0-byte `.git/index.lock` under a running Git process is normal; check for a live process before treating a lock as orphaned.
 5. **One file per entry, filename = machine + ID.** Aggregate append-files written by concurrent sessions on multiple machines produce sync conflicts and lost edits. Each machine owns `entries/<machine>/<machine>--<ID>.md`; a leader catalogs copies by logical ID. Same-content copies deduplicate, while divergent copies remain intact and are flagged in `conflicts.json`.
 6. **Verification is a named observation, not a green exit.** Exit 0, a passing `doctor`, and an installed binary are not evidence. A row count equal to the page size is a failure signal. "Unverified" is always a legal outcome; a confident wrong number is not.
 7. **Liveness signals live outside protected paths.** On macOS, launchd's `/bin/bash` may be unable to write TCC-protected or cloud-synced directories even while the agent process it spawns can — so a run can succeed while its dead-man log line fails silently, the exact blindness the line exists to prevent. Write the RUN log to a plainly writable location (`~/Library/Logs`); a copy inside the store is a mirror, never the signal.
@@ -69,6 +69,11 @@ ID; they never rename or rewrite the evidence file. Compatible divergent copies
 may be acknowledged only with their exact current set of source paths and SHA-256
 values in a decision. Any changed, added, or deleted copy makes that
 acknowledgement stale and returns the ID to `conflicts.json`.
+
+Use `learnings new-id` for machine-derived high-entropy IDs, `learnings decide`
+for ordinary outcomes, and `learnings acknowledge-conflict` only after reviewing
+every current copy. Leader mutations require the catalog generation printed in
+`ACTIVE.md`; stale plans fail instead of writing against a changed fleet snapshot.
 
 Use `scripts/install_learnings_launchd.py` on Macs with a logged-in GUI session.
 For an always-headless leader with no `gui/<uid>` launchd domain, use

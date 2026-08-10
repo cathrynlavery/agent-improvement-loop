@@ -186,21 +186,21 @@ Dropbox and other cloud-synced multi-writer directories. Initialize one local st
 per machine:
 
 ```sh
-./bin/learnings-store --root ~/.agents/learnings init --machine silverfox
+./bin/learnings-store --root ~/.agents/learnings init --machine desktop
 ```
 
 Migrate an existing store non-destructively:
 
 ```sh
 ./bin/learnings-store --root ~/.agents/learnings migrate \
-  --machine silverfox \
+  --machine desktop \
   --source ~/Library/CloudStorage/Dropbox/OpenClaw/.learnings
 ```
 
 Every entry is machine-owned and collision-resistant:
 
 ```text
-~/.agents/learnings/entries/silverfox/silverfox--ERR-20260810-A7K2.md
+~/.agents/learnings/entries/desktop/desktop--ERR-20260810-DESKTOPA7B8C9D0E1.md
 ```
 
 A leader collects the other machine directories and materializes `catalog.json`,
@@ -219,21 +219,56 @@ On any machine, show the leader-published list of items that still need attentio
 learnings status
 ```
 
+Generate new IDs through the store so their suffix combines a stable machine token
+with high-entropy random data:
+
+```sh
+learnings new-id --type ERR
+```
+
+When a leader needs a fresh ID while splitting a collected peer copy, name that
+source machine explicitly: `learnings new-id --type ERR --machine laptop`.
+
+Leader mutations are bound to the exact catalog generation shown by
+`learnings status`. Record a non-conflicted outcome without editing evidence:
+
+```sh
+learnings decide \
+  --id ERR-20260810-DESKTOPA7B8C9D0E1 \
+  --status resolved \
+  --catalog-generation <generation-from-ACTIVE> \
+  --by learn-loop \
+  --note "Verified by the named test or live observation"
+```
+
 Resolve legacy ID collisions without changing evidence by binding a logical re-key
 to the copy's store-relative path and current SHA-256:
 
 ```sh
 learnings rekey \
-  --source-path entries/studio/studio--ERR-20260810-A7K2.md \
+  --source-path entries/laptop/laptop--ERR-20260810-LAPTOPA7K2.md \
   --source-sha256 <sha256-from-catalog> \
-  --new-id ERR-20260810-N8W3 \
-  --by human-review
+  --new-id ERR-20260810-LAPTOPA7B8C9D0E1 \
+  --catalog-generation <generation-from-ACTIVE> \
+  --by human-review \
+  --note "Reviewed same-ID collision" \
+  --confirm-split
 ```
 
-Compatible divergent copies can be acknowledged in `decisions/<ID>.json` with
-`accepted_copies` set to the catalog's exact current set of source paths and
-SHA-256 values. A changed, added, or deleted copy automatically invalidates the
-acknowledgement and reopens the conflict.
+Compatible divergent copies can be acknowledged after reviewing every current
+copy. The command records their exact source paths and SHA-256 values; a changed,
+added, or deleted copy automatically invalidates the acknowledgement and reopens
+the conflict:
+
+```sh
+learnings acknowledge-conflict \
+  --id ERR-20260810-DESKTOPA7B8C9D0E1 \
+  --status resolved \
+  --catalog-generation <generation-from-ACTIVE> \
+  --by human-review \
+  --note "All current copies describe the same verified incident" \
+  --confirm-compatible
+```
 
 The legacy source remains untouched. Remove it only after every machine has run
 live capture, collection, and leader triage successfully for an agreed retention

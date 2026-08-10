@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import unicodedata
@@ -37,6 +38,7 @@ ENTRY_HEADING_RE = re.compile(
 BOLD_STATUS_RE = re.compile(r"^\*\*Status\*\*:\s*(?P<value>.+?)\s*$", re.I | re.M)
 YAML_STATUS_RE = re.compile(r"^status:\s*(?P<value>.+?)\s*$", re.I | re.M)
 ACTIVE_GENERATION_RE = re.compile(r"^- Generation ID: `(?P<id>[a-f0-9]{32})`$", re.M)
+GENERATION_ID_RE = re.compile(r"[a-f0-9]{32}")
 
 ACTIONABLE_STATUSES = {
     "active",
@@ -237,6 +239,36 @@ def strict_entry_id(value: str) -> str:
         raise ValueError(
             "entry ID must match TYPE-YYYYMMDD-SUFFIX with TYPE ERR, LRN, or FEAT"
         )
+    return candidate
+
+
+def strict_entry_type(value: str) -> str:
+    candidate = value.strip().upper()
+    if candidate not in {"ERR", "LRN", "FEAT"}:
+        raise ValueError("entry type must be ERR, LRN, or FEAT")
+    return candidate
+
+
+def strict_generation_id(value: str) -> str:
+    candidate = value.strip().lower()
+    if not GENERATION_ID_RE.fullmatch(candidate):
+        raise ValueError("catalog generation must be a 32-character lowercase hex ID")
+    return candidate
+
+
+def strict_entry_date(value: str) -> str:
+    candidate = value.strip()
+    try:
+        dt.datetime.strptime(candidate, "%Y%m%d")
+    except ValueError as exc:
+        raise ValueError("entry date must be a real YYYYMMDD date") from exc
+    return candidate
+
+
+def strict_decision_status(value: str) -> str:
+    candidate = normalize_status(value)
+    if candidate not in ACTIONABLE_STATUSES | CLOSED_STATUSES:
+        raise ValueError("decision status is missing or unknown")
     return candidate
 
 
@@ -1110,6 +1142,325 @@ def validate_store(root: Path, strict: bool) -> tuple[int, dict[str, Any]]:
     return (1 if failed else 0), summary
 
 
+def catalog_for_mutation(root: Path, expected_generation: str) -> dict[str, Any]:
+    """Load one healthy leader catalog only when its generation is still current."""
+    config = load_store_config(root)
+    if config["role"] != "leader":
+        raise ValueError("fleet decisions and rekeys may be written only on the leader")
+    view_errors = generated_view_errors(root, require_all=True)
+    if view_errors:
+        raise ValueError("; ".join(view_errors))
+    catalog = read_json(root / "catalog.json")
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("entries"), list):
+        raise ValueError("catalog.json is not a valid catalog")
+    expected = strict_generation_id(expected_generation)
+    actual = str(catalog.get("generation_id") or "")
+    if actual != expected:
+        raise ValueError(
+            f"stale catalog generation: expected {expected}, current {actual or 'missing'}"
+        )
+    summary = catalog.get("summary")
+    if not isinstance(summary, dict) or int(summary.get("invalid_files", 0)) != 0:
+        raise ValueError("catalog has invalid files; repair integrity errors before mutation")
+    return catalog
+
+
+def catalog_entry(catalog: dict[str, Any], entry_id: str) -> dict[str, Any]:
+    for row in catalog["entries"]:
+        if isinstance(row, dict) and row.get("id") == entry_id:
+            return row
+    raise ValueError(f"logical entry is not present in the current catalog: {entry_id}")
+
+
+def machine_id_token(machine: str) -> str:
+    token = re.sub(r"[^A-Z0-9]", "", machine.upper())[:8]
+    return token or "MACHINE"
+
+
+def known_entry_ids(root: Path) -> set[str]:
+    copies, _ = scan_entry_copies(root)
+    mappings, _ = load_rekey_mappings(root)
+    decisions, _ = load_decisions(root)
+    result = {copy.entry_id for copy in copies} | {copy.source_id for copy in copies}
+    result.update(mapping["new_id"] for mapping in mappings)
+    result.update(mapping["source_id"] for mapping in mappings)
+    result.update(decisions)
+    for catalog_path in (root / "catalog.json", root / "fleet/catalog.json"):
+        if not catalog_path.is_file():
+            continue
+        try:
+            catalog = read_json(catalog_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for row in catalog.get("entries", []) if isinstance(catalog, dict) else []:
+            if isinstance(row, dict) and normalized_entry_id(str(row.get("id") or "")):
+                result.add(strict_entry_id(str(row["id"])))
+    return result
+
+
+def generate_entry_id(
+    root: Path,
+    entry_type: str,
+    entry_date: Optional[str] = None,
+    source_machine: Optional[str] = None,
+) -> str:
+    """Generate a machine-derived, high-entropy logical ID not present locally."""
+    config = load_store_config(root)
+    prefix = strict_entry_type(entry_type)
+    date = strict_entry_date(
+        entry_date or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+    )
+    selected_machine = (
+        machine_slug(source_machine) if source_machine else config["machine"]
+    )
+    if selected_machine != config["machine"]:
+        if config["role"] != "leader":
+            raise ValueError("only the leader may generate an ID for another machine")
+        machine_dir = root / "entries" / selected_machine
+        if machine_dir.is_symlink() or not machine_dir.is_dir():
+            raise ValueError(
+                f"source machine is not present in the leader store: {selected_machine}"
+            )
+    machine_token = machine_id_token(selected_machine)
+    with store_lock(root, "ids"):
+        existing = known_entry_ids(root)
+        for _ in range(100):
+            candidate = f"{prefix}-{date}-{machine_token}{secrets.token_hex(5).upper()}"
+            if candidate not in existing:
+                return candidate
+    raise ValueError("could not generate a unique entry ID after 100 attempts")
+
+
+def decision_payload(
+    entry_id: str,
+    status: str,
+    *,
+    actor: str,
+    note: str,
+    target: str = "",
+    evidence: Optional[list[str]] = None,
+    accepted_copies: Optional[list[dict[str, str]]] = None,
+) -> dict[str, Any]:
+    actor = actor.strip()
+    note = note.strip()
+    if not actor:
+        raise ValueError("decision recorder (--by) is required")
+    if not note:
+        raise ValueError("decision note is required")
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "id": strict_entry_id(entry_id),
+        "status": strict_decision_status(status),
+        "decided_at": utc_now(),
+        "by": actor,
+        "note": note,
+    }
+    if target.strip():
+        payload["target"] = target.strip()
+    cleaned_evidence = [item.strip() for item in (evidence or []) if item.strip()]
+    if cleaned_evidence:
+        payload["evidence"] = cleaned_evidence
+    if accepted_copies is not None:
+        payload["accepted_copies"] = sorted(
+            accepted_copies, key=lambda item: (item["path"], item["sha256"])
+        )
+    return payload
+
+
+def decision_identity(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: item
+        for key, item in value.items()
+        if key not in {"decided_at", "path"}
+    }
+
+
+def write_decision_locked(
+    root: Path, payload: dict[str, Any], *, replace_existing: bool
+) -> tuple[Path, bool]:
+    path = root / "decisions" / f"{payload['id']}.json"
+    if path.is_symlink():
+        raise ValueError(f"decision destination is a symlink: {path}")
+    if path.exists():
+        existing = read_json(path)
+        if not isinstance(existing, dict):
+            raise ValueError(f"existing decision is not a JSON object: {path}")
+        if decision_identity(existing) == decision_identity(payload):
+            return path, False
+        if not replace_existing:
+            raise ValueError(
+                f"decision already exists for {payload['id']}; pass --replace after review"
+            )
+        atomic_write_json(path, payload)
+        return path, True
+    try:
+        atomic_create_json(path, payload)
+    except FileExistsError as exc:
+        raise ValueError(f"decision appeared concurrently: {path}; retry from a fresh catalog") from exc
+    return path, True
+
+
+def decide_and_build(
+    root: Path,
+    entry_id: str,
+    status: str,
+    expected_generation: str,
+    *,
+    actor: str,
+    note: str,
+    target: str = "",
+    evidence: Optional[list[str]] = None,
+    replace_existing: bool = False,
+) -> tuple[Path, dict[str, Any], bool, dict[str, Any]]:
+    """Write an ordinary decision without allowing it to hide a conflict."""
+    entry_id = strict_entry_id(entry_id)
+    with store_lock(root, "catalog-build"):
+        catalog = catalog_for_mutation(root, expected_generation)
+        row = catalog_entry(catalog, entry_id)
+        if row.get("conflict"):
+            raise ValueError(
+                f"{entry_id} is conflicted; rekey it or use acknowledge-conflict"
+            )
+        accepted_copies = None
+        current_decision = row.get("decision")
+        if row.get("raw_conflict") and isinstance(current_decision, dict):
+            current_accepted = current_decision.get("accepted_copies")
+            if isinstance(current_accepted, list):
+                accepted_copies = current_accepted
+        payload = decision_payload(
+            entry_id,
+            status,
+            actor=actor,
+            note=note,
+            target=target,
+            evidence=evidence,
+            accepted_copies=accepted_copies,
+        )
+        with store_lock(root, "decisions"):
+            path, changed = write_decision_locked(
+                root, payload, replace_existing=replace_existing
+            )
+        refreshed = _build_catalog_locked(root) if changed else catalog
+    return path, payload, changed, refreshed
+
+
+def acknowledge_conflict_and_build(
+    root: Path,
+    entry_id: str,
+    status: str,
+    expected_generation: str,
+    *,
+    actor: str,
+    note: str,
+    target: str = "",
+    evidence: Optional[list[str]] = None,
+    replace_existing: bool = False,
+    confirm_compatible: bool = False,
+) -> tuple[Path, dict[str, Any], bool, dict[str, Any]]:
+    """Acknowledge one human-reviewed compatible conflict at an exact copy set."""
+    if not confirm_compatible:
+        raise ValueError("--confirm-compatible is required after reviewing every copy")
+    entry_id = strict_entry_id(entry_id)
+    with store_lock(root, "catalog-build"):
+        catalog = catalog_for_mutation(root, expected_generation)
+        row = catalog_entry(catalog, entry_id)
+        if not row.get("raw_conflict"):
+            raise ValueError(f"{entry_id} is not a current divergent-copy conflict")
+        if not row.get("conflict") and not row.get("conflict_acknowledged"):
+            raise ValueError(f"{entry_id} is not a current divergent-copy conflict")
+        copies = row.get("copies")
+        if not isinstance(copies, list) or len(copies) < 2:
+            raise ValueError(f"{entry_id} does not have multiple current source copies")
+        accepted_copies = [
+            {"path": str(copy["source_path"]), "sha256": str(copy["source_sha256"])}
+            for copy in copies
+        ]
+        payload = decision_payload(
+            entry_id,
+            status,
+            actor=actor,
+            note=note,
+            target=target,
+            evidence=evidence,
+            accepted_copies=accepted_copies,
+        )
+        with store_lock(root, "decisions"):
+            path, changed = write_decision_locked(
+                root, payload, replace_existing=replace_existing
+            )
+        refreshed = _build_catalog_locked(root) if changed else catalog
+        refreshed_row = catalog_entry(refreshed, entry_id)
+        if refreshed_row.get("conflict"):
+            raise ValueError(f"{entry_id} remained conflicted after acknowledgement")
+    return path, payload, changed, refreshed
+
+
+def rekey_and_build(
+    root: Path,
+    source_path: str,
+    source_sha256: str,
+    new_id: str,
+    expected_generation: str,
+    *,
+    actor: str,
+    note: str,
+    confirm_split: bool,
+    alias_existing: bool,
+) -> tuple[Path, dict[str, Any], bool, dict[str, Any]]:
+    """Apply a reviewed rekey against one exact catalog generation."""
+    if not confirm_split:
+        raise ValueError("--confirm-split is required after reviewing the source copy")
+    relative = normalized_source_path(source_path)
+    new_id = strict_entry_id(new_id)
+    with store_lock(root, "catalog-build"):
+        catalog = catalog_for_mutation(root, expected_generation)
+        source_row = None
+        source_copy = None
+        for row in catalog["entries"]:
+            for copy in row.get("copies", []):
+                if copy.get("source_path") == relative:
+                    source_row = row
+                    source_copy = copy
+                    break
+            if source_copy:
+                break
+        if source_copy is None or source_row is None:
+            raise ValueError(f"rekey source is not present in the current catalog: {relative}")
+        if str(source_copy.get("source_sha256")) != source_sha256.strip().lower():
+            raise ValueError(f"stale source hash for {relative}")
+        mappings, invalid = load_rekey_mappings(root)
+        if invalid:
+            raise ValueError("invalid rekey mappings must be repaired before mutation")
+        same_mapping = any(
+            mapping["source_path"] == relative
+            and mapping["source_sha256"] == source_sha256.strip().lower()
+            and mapping["new_id"] == new_id
+            for mapping in mappings
+        )
+        existing_ids = {
+            str(row.get("id")) for row in catalog["entries"] if isinstance(row, dict)
+        }
+        if not same_mapping and not source_row.get("conflict"):
+            raise ValueError("rekey source is not part of a current conflict")
+        if not same_mapping and new_id in existing_ids and not alias_existing:
+            raise ValueError(
+                f"{new_id} already exists; pass --alias-existing only for a reviewed alias"
+            )
+        if alias_existing and new_id not in existing_ids:
+            raise ValueError("--alias-existing requires a logical ID already in the catalog")
+        with store_lock(root, "rekeys"):
+            path, mapping, created = _write_rekey_mapping_locked(
+                root,
+                relative,
+                source_sha256,
+                new_id,
+                actor=actor,
+                note=note,
+            )
+        refreshed = _build_catalog_locked(root) if created else catalog
+    return path, mapping, created, refreshed
+
+
 def active_view_path(root: Path) -> Path:
     """Prefer the leader-published fleet view on writers."""
     config = load_store_config(root)
@@ -1143,8 +1494,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     normalize_parser.add_argument("--machine", required=True)
 
+    new_id_parser = subparsers.add_parser(
+        "new-id", help="generate a machine-derived collision-resistant entry ID"
+    )
+    new_id_parser.add_argument("--type", required=True, dest="entry_type")
+    new_id_parser.add_argument("--date", default="", help="optional UTC date as YYYYMMDD")
+    new_id_parser.add_argument(
+        "--machine", default="", help="leader-only source machine override for a rekey"
+    )
+
     rekey_parser = subparsers.add_parser(
-        "rekey", help="atomically map one immutable entry copy to a new logical ID"
+        "rekey", help="generation-guarded mapping of one evidence copy to a logical ID"
     )
     rekey_parser.add_argument(
         "--source-path", required=True, help="store-relative entries/<machine>/<file>.md"
@@ -1153,8 +1513,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-sha256", required=True, help="current SHA-256 of the immutable copy"
     )
     rekey_parser.add_argument("--new-id", required=True)
-    rekey_parser.add_argument("--by", default="")
-    rekey_parser.add_argument("--note", default="")
+    rekey_parser.add_argument("--catalog-generation", required=True)
+    rekey_parser.add_argument("--by", required=True)
+    rekey_parser.add_argument("--note", required=True)
+    rekey_parser.add_argument("--confirm-split", action="store_true")
+    rekey_parser.add_argument("--alias-existing", action="store_true")
+
+    decide_parser = subparsers.add_parser(
+        "decide", help="write an atomic generation-guarded outcome for one logical entry"
+    )
+    decide_parser.add_argument("--id", required=True, dest="entry_id")
+    decide_parser.add_argument("--status", required=True)
+    decide_parser.add_argument("--catalog-generation", required=True)
+    decide_parser.add_argument("--by", required=True)
+    decide_parser.add_argument("--note", required=True)
+    decide_parser.add_argument("--target", default="")
+    decide_parser.add_argument("--evidence", action="append", default=[])
+    decide_parser.add_argument("--replace", action="store_true")
+
+    acknowledge_parser = subparsers.add_parser(
+        "acknowledge-conflict",
+        help="record that all current divergent copies were reviewed as compatible",
+    )
+    acknowledge_parser.add_argument("--id", required=True, dest="entry_id")
+    acknowledge_parser.add_argument("--status", required=True)
+    acknowledge_parser.add_argument("--catalog-generation", required=True)
+    acknowledge_parser.add_argument("--by", required=True)
+    acknowledge_parser.add_argument("--note", required=True)
+    acknowledge_parser.add_argument("--target", default="")
+    acknowledge_parser.add_argument("--evidence", action="append", default=[])
+    acknowledge_parser.add_argument("--replace", action="store_true")
+    acknowledge_parser.add_argument("--confirm-compatible", action="store_true")
 
     subparsers.add_parser("catalog", help="materialize catalog, conflicts, and ACTIVE.md")
     subparsers.add_parser("status", help="show the actionable fleet learning list")
@@ -1186,20 +1575,69 @@ def main(argv: Optional[list[str]] = None) -> int:
             result = build_catalog(root)
             print(" ".join(f"{key}={value}" for key, value in result["summary"].items()))
             return 0
+        if args.command == "new-id":
+            entry_id = generate_entry_id(
+                root,
+                args.entry_type,
+                args.date or None,
+                args.machine or None,
+            )
+            config = load_store_config(root)
+            selected_machine = machine_slug(args.machine) if args.machine else config["machine"]
+            print(f"id={entry_id} machine={selected_machine}")
+            return 0
         if args.command == "rekey":
-            path, mapping, created = write_rekey_mapping(
+            path, mapping, created, catalog = rekey_and_build(
                 root,
                 args.source_path,
                 args.source_sha256,
                 args.new_id,
+                args.catalog_generation,
                 actor=args.by,
                 note=args.note,
+                confirm_split=args.confirm_split,
+                alias_existing=args.alias_existing,
             )
-            build_catalog(root)
             print(
                 f"rekey={'created' if created else 'existing'} "
                 f"source={mapping['source_path']} new_id={mapping['new_id']} "
-                f"mapping={path}"
+                f"mapping={path} generation={catalog['generation_id']}"
+            )
+            return 0
+        if args.command == "decide":
+            path, payload, changed, catalog = decide_and_build(
+                root,
+                args.entry_id,
+                args.status,
+                args.catalog_generation,
+                actor=args.by,
+                note=args.note,
+                target=args.target,
+                evidence=args.evidence,
+                replace_existing=args.replace,
+            )
+            print(
+                f"decision={'written' if changed else 'existing'} id={payload['id']} "
+                f"status={payload['status']} path={path} generation={catalog['generation_id']}"
+            )
+            return 0
+        if args.command == "acknowledge-conflict":
+            path, payload, changed, catalog = acknowledge_conflict_and_build(
+                root,
+                args.entry_id,
+                args.status,
+                args.catalog_generation,
+                actor=args.by,
+                note=args.note,
+                target=args.target,
+                evidence=args.evidence,
+                replace_existing=args.replace,
+                confirm_compatible=args.confirm_compatible,
+            )
+            print(
+                f"acknowledgement={'written' if changed else 'existing'} "
+                f"id={payload['id']} status={payload['status']} path={path} "
+                f"generation={catalog['generation_id']}"
             )
             return 0
         if args.command == "status":
