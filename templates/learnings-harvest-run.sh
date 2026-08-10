@@ -13,7 +13,7 @@ CODEX_BIN="${CODEX_BIN:-$HOME/.local/bin/codex}"
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 mkdir -p "$LEARNINGS_ROOT" "$HOME/Library/Logs"
-touch "$RUN_LOG" "$DETAIL_LOG"
+touch "$RUN_LOG" "$DETAIL_LOG" "$LEARNINGS_ROOT/harvest-log.md"
 if [ "${AGENT_LEARNINGS_LIVENESS_ONLY:-0}" = "1" ]; then
   "$LOOP_ROOT/bin/learnings-store" --root "$LEARNINGS_ROOT" catalog >> "$DETAIL_LOG" 2>&1
   catalog_exit=$?

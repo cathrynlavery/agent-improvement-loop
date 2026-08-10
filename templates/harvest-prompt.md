@@ -18,4 +18,6 @@ Before writing, search this machine's entries and `fleet/catalog.json` when pres
 
 Every new file must contain a unique ID, `**Status**: pending`, priority, area, summary, details, suggested action, source agent, evidence references, and redacted excerpts. Never append to aggregate files. Never edit another machine's directory. Never write secrets or unnecessary PII.
 
-Write at most ten entries, then append one liveness summary line to `harvest-log.md`.
+Write at most ten entries, then append one liveness summary line to the root file
+`~/.agents/learnings/harvest-log.md`. Create that root file if needed. Never use or
+edit a `harvest-log.md` under `legacy/`.
