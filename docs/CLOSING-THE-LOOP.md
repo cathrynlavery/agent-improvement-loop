@@ -50,6 +50,7 @@ keeps its canonical evidence under `~/.agents/learnings/`:
   entries/<machine>/<machine>--<ID>.md
   legacy/<machine>/...
   decisions/<ID>.json
+  rekeys/<new-ID>--<source-token>.json
   queue/FIX-QUEUE.md
   catalog.json
   conflicts.json
@@ -63,6 +64,12 @@ machine-owned entry directories, rebuilds the catalog, and publishes the generat
 catalog back to reachable peers. Evidence remains immutable; triage outcomes are
 separate decisions, so collection cannot overwrite them.
 
+Re-key overlays bind an immutable copy's relative path and SHA-256 to a new logical
+ID; they never rename or rewrite the evidence file. Compatible divergent copies
+may be acknowledged only with their exact current set of source paths and SHA-256
+values in a decision. Any changed, added, or deleted copy makes that
+acknowledgement stale and returns the ID to `conflicts.json`.
+
 Use `scripts/install_learnings_launchd.py` on Macs with a logged-in GUI session.
 For an always-headless leader with no `gui/<uid>` launchd domain, use
 `scripts/install_learnings_cron.py`; it owns only the marked learnings block and
@@ -71,3 +78,8 @@ preserves unrelated crontab entries.
 The leader must have an authenticated headless agent runtime. A machine without
 one remains a writer; do not schedule a collector/fixloop there just because it is
 always online.
+
+If a peer is asleep during initial rollout, `scripts/bootstrap_learnings_peer.sh`
+is a retry-safe writer bootstrap: it deploys the runtime, migrates the untouched
+legacy store, updates the agent instruction, installs capture, runs a liveness
+check, and writes a completion marker only after all steps succeed.

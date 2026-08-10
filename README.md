@@ -219,6 +219,22 @@ On any machine, show the leader-published list of items that still need attentio
 learnings status
 ```
 
+Resolve legacy ID collisions without changing evidence by binding a logical re-key
+to the copy's store-relative path and current SHA-256:
+
+```sh
+learnings rekey \
+  --source-path entries/studio/studio--ERR-20260810-A7K2.md \
+  --source-sha256 <sha256-from-catalog> \
+  --new-id ERR-20260810-N8W3 \
+  --by human-review
+```
+
+Compatible divergent copies can be acknowledged in `decisions/<ID>.json` with
+`accepted_copies` set to the catalog's exact current set of source paths and
+SHA-256 values. A changed, added, or deleted copy automatically invalidates the
+acknowledgement and reopens the conflict.
+
 The legacy source remains untouched. Remove it only after every machine has run
 live capture, collection, and leader triage successfully for an agreed retention
 period.

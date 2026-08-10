@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -18,19 +19,24 @@ import re
 import shutil
 import sys
 import unicodedata
-from dataclasses import dataclass
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
 SCHEMA_VERSION = 1
 ENTRY_ID_RE = re.compile(r"\b(?P<id>(?:ERR|LRN|FEAT)-\d{8}-[A-Z0-9]{4,})\b", re.I)
+ENTRY_ID_FULL_RE = re.compile(r"(?:ERR|LRN|FEAT)-\d{8}-[A-Z0-9]{4,}", re.I)
+SHA256_RE = re.compile(r"[a-f0-9]{64}")
 ENTRY_HEADING_RE = re.compile(
     r"^## \[(?P<id>(?:ERR|LRN|FEAT)-\d{8}-[A-Z0-9]{4,})\][^\n]*$",
     re.I | re.M,
 )
 BOLD_STATUS_RE = re.compile(r"^\*\*Status\*\*:\s*(?P<value>.+?)\s*$", re.I | re.M)
 YAML_STATUS_RE = re.compile(r"^status:\s*(?P<value>.+?)\s*$", re.I | re.M)
+ACTIVE_GENERATION_RE = re.compile(r"^- Generation ID: `(?P<id>[a-f0-9]{32})`$", re.M)
 
 ACTIONABLE_STATUSES = {
     "active",
@@ -106,6 +112,44 @@ def atomic_write_json(path: Path, value: Any) -> None:
     atomic_write_bytes(path, payload.encode("utf-8"))
 
 
+def atomic_create_json(path: Path, value: Any) -> None:
+    """Publish a complete JSON file without ever replacing an existing path."""
+    payload = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.create-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            if tmp.exists():
+                tmp.unlink()
+            raise
+        os.link(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+@contextmanager
+def store_lock(root: Path, name: str) -> Iterable[None]:
+    """Serialize store publications while leaving evidence untouched."""
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = root / f".{name}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -132,6 +176,7 @@ def initialize_store(root: Path, machine: str, role: str = "writer") -> dict[str
         Path("entries") / machine,
         Path("legacy") / machine,
         Path("decisions"),
+        Path("rekeys"),
         Path("queue"),
         Path("reviews"),
         Path("fleet"),
@@ -184,6 +229,49 @@ def copy_preserving(source: Path, target: Path) -> str:
 def normalized_entry_id(value: str) -> Optional[str]:
     match = ENTRY_ID_RE.search(value)
     return match.group("id").upper() if match else None
+
+
+def strict_entry_id(value: str) -> str:
+    candidate = value.strip().upper()
+    if not ENTRY_ID_FULL_RE.fullmatch(candidate):
+        raise ValueError(
+            "entry ID must match TYPE-YYYYMMDD-SUFFIX with TYPE ERR, LRN, or FEAT"
+        )
+    return candidate
+
+
+def normalized_source_path(value: str) -> str:
+    """Return a safe store-relative immutable evidence path."""
+    path = Path(value)
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ValueError("source path must be a normalized relative path")
+    if len(path.parts) != 3 or path.parts[0] != "entries" or path.suffix != ".md":
+        raise ValueError("source path must match entries/<machine>/<entry>.md")
+    return path.as_posix()
+
+
+def verified_entry_path(root: Path, relative: str) -> Path:
+    """Resolve one entry path only when every store-owned component is non-symlinked."""
+    normalized = normalized_source_path(relative)
+    root = root.expanduser()
+    entries_root = root / "entries"
+    candidate = root / normalized
+    for component in (root, entries_root, candidate.parent, candidate):
+        if component.is_symlink():
+            raise ValueError(f"entry path contains a symlink: {component}")
+    if not entries_root.is_dir():
+        raise ValueError(f"entries directory does not exist: {entries_root}")
+    if not candidate.is_file():
+        raise ValueError(f"entry file does not exist: {normalized}")
+    entries_real = entries_root.resolve(strict=True)
+    candidate_real = candidate.resolve(strict=True)
+    if not candidate_real.is_relative_to(entries_real):
+        raise ValueError(f"entry path escapes the entries directory: {normalized}")
+    return candidate
 
 
 def split_aggregate_entries(text: str) -> Iterable[tuple[str, str]]:
@@ -344,29 +432,347 @@ def title_from_text(text: str, entry_id: str) -> str:
 
 @dataclass(frozen=True)
 class EntryCopy:
+    # entry_id is the effective logical ID after a validated re-key overlay.
     entry_id: str
+    source_id: str
     machine: str
     path: str
     sha256: str
+    source_path: str
+    source_sha256: str
     status: str
     status_source: str
     title: str
+    rekey: Optional[dict[str, Any]] = None
 
 
-def load_decisions(root: Path) -> dict[str, dict[str, Any]]:
-    decisions: dict[str, dict[str, Any]] = {}
-    for path in sorted((root / "decisions").glob("*.json")):
+def load_rekey_mappings(
+    root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Load structurally valid re-key overlays without applying them."""
+    mappings: list[dict[str, Any]] = []
+    invalid: list[dict[str, str]] = []
+    for path in sorted((root / "rekeys").glob("*.json")):
+        display_path = str(path.relative_to(root))
+        if path.is_symlink():
+            invalid.append(
+                {"path": display_path, "reason": "invalid rekey mapping: file is a symlink"}
+            )
+            continue
         try:
             data = read_json(path)
-        except (OSError, json.JSONDecodeError):
+            if not isinstance(data, dict):
+                raise ValueError("mapping must be a JSON object")
+            source_path = normalized_source_path(str(data.get("source_path") or ""))
+            source_id = strict_entry_id(str(data.get("source_id") or ""))
+            source_sha256 = str(data.get("source_sha256") or "").strip().lower()
+            if not SHA256_RE.fullmatch(source_sha256):
+                raise ValueError("source_sha256 must be a lowercase SHA-256 digest")
+            new_id = strict_entry_id(str(data.get("new_id") or ""))
+            if new_id == source_id:
+                raise ValueError("new_id must differ from source_id")
+            if new_id.split("-", 1)[0] != source_id.split("-", 1)[0]:
+                raise ValueError("new_id must retain the source ERR/LRN/FEAT type")
+            source_token = sha256_bytes(source_path.encode("utf-8"))[:12]
+            expected_name = f"{new_id}--{source_token}.json"
+            if path.name != expected_name:
+                raise ValueError(f"mapping filename must be exactly {expected_name}")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            invalid.append({"path": display_path, "reason": f"invalid rekey mapping: {exc}"})
             continue
-        entry_id = normalized_entry_id(path.stem)
-        if not entry_id or not isinstance(data, dict):
+        mappings.append(
+            {
+                **data,
+                "source_path": source_path,
+                "source_id": source_id,
+                "source_sha256": source_sha256,
+                "new_id": new_id,
+                "mapping_path": display_path,
+            }
+        )
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for mapping in mappings:
+        grouped.setdefault(mapping["source_path"], []).append(mapping)
+    duplicate_paths = {source for source, rows in grouped.items() if len(rows) > 1}
+    if duplicate_paths:
+        retained: list[dict[str, Any]] = []
+        for mapping in mappings:
+            if mapping["source_path"] in duplicate_paths:
+                invalid.append(
+                    {
+                        "path": mapping["mapping_path"],
+                        "reason": (
+                            "invalid rekey mapping: multiple mappings target "
+                            f"{mapping['source_path']}"
+                        ),
+                    }
+                )
+            else:
+                retained.append(mapping)
+        mappings = retained
+    return mappings, invalid
+
+
+def write_rekey_mapping(
+    root: Path,
+    source_path: str,
+    source_sha256: str,
+    new_id: str,
+    *,
+    actor: str = "",
+    note: str = "",
+) -> tuple[Path, dict[str, Any], bool]:
+    """Atomically record a path-and-hash-bound logical re-key overlay."""
+    load_store_config(root)
+    with store_lock(root, "rekeys"):
+        return _write_rekey_mapping_locked(
+            root,
+            source_path,
+            source_sha256,
+            new_id,
+            actor=actor,
+            note=note,
+        )
+
+
+def _write_rekey_mapping_locked(
+    root: Path,
+    source_path: str,
+    source_sha256: str,
+    new_id: str,
+    *,
+    actor: str,
+    note: str,
+) -> tuple[Path, dict[str, Any], bool]:
+    relative = normalized_source_path(source_path)
+    expected_sha256 = source_sha256.strip().lower()
+    if not SHA256_RE.fullmatch(expected_sha256):
+        raise ValueError("source sha256 must be a lowercase SHA-256 digest")
+    new_id = strict_entry_id(new_id)
+    evidence_path = verified_entry_path(root, relative)
+    actual_sha256 = sha256_bytes(evidence_path.read_bytes())
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"stale source hash for {relative}: expected {expected_sha256}, "
+            f"current {actual_sha256}"
+        )
+    source_id = normalized_entry_id(evidence_path.name) or normalized_entry_id(
+        evidence_path.read_text(encoding="utf-8", errors="replace")
+    )
+    if not source_id:
+        raise ValueError(f"rekey source has no entry ID: {relative}")
+    if new_id == source_id:
+        raise ValueError("new logical ID must differ from the source ID")
+    if new_id.split("-", 1)[0] != source_id.split("-", 1)[0]:
+        raise ValueError("new logical ID must retain the source ERR/LRN/FEAT type")
+
+    existing, invalid = load_rekey_mappings(root)
+    if invalid:
+        raise ValueError(
+            "cannot write a rekey while invalid mappings exist: "
+            + "; ".join(f"{row['path']}: {row['reason']}" for row in invalid)
+        )
+    for mapping in existing:
+        if mapping["source_path"] != relative:
             continue
-        status = normalize_status(str(data.get("status") or ""))
-        if status != "unknown":
-            decisions[entry_id] = {**data, "status": status, "path": str(path)}
-    return decisions
+        if (
+            mapping["source_sha256"] == expected_sha256
+            and mapping["new_id"] == new_id
+            and mapping["source_id"] == source_id
+        ):
+            return root / mapping["mapping_path"], mapping, False
+        raise ValueError(
+            f"source already has a different rekey mapping: {mapping['mapping_path']}"
+        )
+
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "source_path": relative,
+        "source_id": source_id,
+        "source_sha256": expected_sha256,
+        "new_id": new_id,
+        "created_at": utc_now(),
+    }
+    if actor.strip():
+        payload["by"] = actor.strip()
+    if note.strip():
+        payload["note"] = note.strip()
+    source_token = sha256_bytes(relative.encode("utf-8"))[:12]
+    mapping_path = root / "rekeys" / f"{new_id}--{source_token}.json"
+    try:
+        atomic_create_json(mapping_path, payload)
+    except FileExistsError:
+        try:
+            raced = read_json(mapping_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"rekey destination appeared concurrently and is unreadable: {mapping_path}"
+            ) from exc
+        identity = ("source_path", "source_id", "source_sha256", "new_id")
+        if isinstance(raced, dict) and all(raced.get(key) == payload[key] for key in identity):
+            return mapping_path, raced, False
+        raise ValueError(
+            f"rekey destination appeared concurrently with different content: {mapping_path}"
+        )
+    return mapping_path, payload, True
+
+
+def apply_rekey_mappings(
+    copies: list[EntryCopy], mappings: list[dict[str, Any]]
+) -> tuple[list[EntryCopy], list[dict[str, str]], list[dict[str, Any]]]:
+    """Apply only mappings whose immutable source path and hash still match."""
+    by_path = {copy.source_path: copy for copy in copies}
+    applied_by_path: dict[str, EntryCopy] = {}
+    invalid: list[dict[str, str]] = []
+    applied: list[dict[str, Any]] = []
+    for mapping in mappings:
+        source_path = mapping["source_path"]
+        copy = by_path.get(source_path)
+        if copy is None:
+            invalid.append(
+                {
+                    "path": mapping["mapping_path"],
+                    "reason": f"rekey source is missing: {source_path}",
+                }
+            )
+            continue
+        if copy.source_id != mapping["source_id"]:
+            invalid.append(
+                {
+                    "path": mapping["mapping_path"],
+                    "reason": (
+                        f"rekey source ID changed for {source_path}: expected "
+                        f"{mapping['source_id']}, current {copy.source_id}"
+                    ),
+                }
+            )
+            continue
+        if copy.source_sha256 != mapping["source_sha256"]:
+            invalid.append(
+                {
+                    "path": mapping["mapping_path"],
+                    "reason": (
+                        f"stale rekey hash for {source_path}: expected "
+                        f"{mapping['source_sha256']}, current {copy.source_sha256}"
+                    ),
+                }
+            )
+            continue
+        audit = {
+            "mapping_path": mapping["mapping_path"],
+            "source_id": copy.source_id,
+            "source_path": copy.source_path,
+            "source_sha256": copy.source_sha256,
+            "new_id": mapping["new_id"],
+        }
+        applied_copy = replace(copy, entry_id=mapping["new_id"], rekey=audit)
+        applied_by_path[source_path] = applied_copy
+        applied.append(audit)
+    return (
+        [applied_by_path.get(copy.source_path, copy) for copy in copies],
+        invalid,
+        applied,
+    )
+
+
+def load_decisions(
+    root: Path,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+    decisions: dict[str, dict[str, Any]] = {}
+    invalid: list[dict[str, str]] = []
+    duplicate_ids: set[str] = set()
+    for path in sorted((root / "decisions").glob("*.json")):
+        display_path = str(path.relative_to(root))
+        if path.is_symlink():
+            invalid.append({"path": display_path, "reason": "decision file is a symlink"})
+            continue
+        try:
+            data = read_json(path)
+            if not isinstance(data, dict):
+                raise ValueError("decision must be a JSON object")
+            entry_id = strict_entry_id(path.stem)
+            if path.name != f"{entry_id}.json":
+                raise ValueError(f"decision filename must be exactly {entry_id}.json")
+            if "id" in data and str(data["id"]) != entry_id:
+                raise ValueError(f"decision id must exactly match {entry_id}")
+            status = normalize_status(str(data.get("status") or ""))
+            if status == "unknown":
+                raise ValueError("decision has missing or unknown status")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            invalid.append({"path": display_path, "reason": f"invalid decision: {exc}"})
+            continue
+        if "accepted_hashes" in data:
+            invalid.append(
+                {
+                    "path": display_path,
+                    "reason": (
+                        "invalid decision: accepted_hashes is not copy-specific; "
+                        "use accepted_copies with path and sha256"
+                    ),
+                }
+            )
+            continue
+        if entry_id in decisions:
+            duplicate_ids.add(entry_id)
+            invalid.append(
+                {
+                    "path": display_path,
+                    "reason": f"duplicate decision for {entry_id}",
+                }
+            )
+            continue
+        decisions[entry_id] = {
+            **data,
+            "id": entry_id,
+            "status": status,
+            "path": display_path,
+        }
+    for entry_id in duplicate_ids:
+        first = decisions.pop(entry_id, None)
+        if first:
+            invalid.append(
+                {
+                    "path": str(first["path"]),
+                    "reason": f"duplicate decision for {entry_id}",
+                }
+            )
+    return decisions, invalid
+
+
+def decision_copy_acknowledgement(
+    decision: Optional[dict[str, Any]], current_copies: list[EntryCopy]
+) -> tuple[bool, bool, list[dict[str, str]], Optional[str]]:
+    """Bind compatible-copy acknowledgement to the exact path-and-hash set."""
+    if not decision or "accepted_copies" not in decision:
+        return False, False, [], None
+    value = decision.get("accepted_copies")
+    if not isinstance(value, list):
+        return True, False, [], "accepted_copies must be an array"
+    accepted: list[dict[str, str]] = []
+    try:
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("each accepted copy must be an object")
+            path = normalized_source_path(str(item.get("path") or ""))
+            digest = str(item.get("sha256") or "").strip().lower()
+            if not SHA256_RE.fullmatch(digest):
+                raise ValueError(f"accepted copy has invalid sha256: {path}")
+            accepted.append({"path": path, "sha256": digest})
+    except ValueError as exc:
+        return True, False, accepted, str(exc)
+    pairs = [(item["path"], item["sha256"]) for item in accepted]
+    if len(pairs) != len(set(pairs)) or len({path for path, _ in pairs}) != len(pairs):
+        return True, False, accepted, "accepted_copies contains duplicate paths or pairs"
+    accepted = sorted(accepted, key=lambda item: (item["path"], item["sha256"]))
+    current = sorted(
+        (
+            {"path": copy.source_path, "sha256": copy.source_sha256}
+            for copy in current_copies
+        ),
+        key=lambda item: (item["path"], item["sha256"]),
+    )
+    return True, accepted == current, accepted, None
 
 
 def select_status(copies: list[EntryCopy]) -> str:
@@ -381,10 +787,36 @@ def scan_entry_copies(root: Path) -> tuple[list[EntryCopy], list[dict[str, str]]
     copies: list[EntryCopy] = []
     invalid: list[dict[str, str]] = []
     entries_root = root / "entries"
-    for path in sorted(entries_root.glob("*/*.md")):
-        text = path.read_text(encoding="utf-8", errors="replace")
+    if root.is_symlink():
+        return [], [{"path": str(root), "reason": "store root is a symlink"}]
+    if entries_root.is_symlink():
+        return [], [{"path": str(entries_root), "reason": "entries directory is a symlink"}]
+    if not entries_root.is_dir():
+        return [], [{"path": str(entries_root), "reason": "entries directory is missing"}]
+    paths: list[Path] = []
+    for machine_dir in sorted(entries_root.iterdir()):
+        if machine_dir.is_symlink():
+            invalid.append(
+                {"path": str(machine_dir), "reason": "entry machine directory is a symlink"}
+            )
+            continue
+        if machine_dir.is_dir():
+            paths.extend(sorted(machine_dir.glob("*.md")))
+    for discovered_path in paths:
+        relative_path = str(discovered_path.relative_to(root))
+        try:
+            path = verified_entry_path(root, relative_path)
+            payload = path.read_bytes()
+        except (OSError, ValueError) as exc:
+            invalid.append({"path": relative_path, "reason": f"unsafe entry path: {exc}"})
+            continue
+        text = payload.decode("utf-8", errors="replace")
         entry_id = normalized_entry_id(path.name) or normalized_entry_id(text)
-        machine = machine_slug(path.parent.name)
+        try:
+            machine = machine_slug(path.parent.name)
+        except ValueError as exc:
+            invalid.append({"path": relative_path, "reason": str(exc)})
+            continue
         if not entry_id:
             invalid.append({"path": str(path), "reason": "missing entry ID"})
             continue
@@ -396,12 +828,16 @@ def scan_entry_copies(root: Path) -> tuple[list[EntryCopy], list[dict[str, str]]
         status, source = parse_status(text)
         if status == "unknown":
             invalid.append({"path": str(path), "reason": "missing or unknown status"})
+        digest = sha256_bytes(payload)
         copies.append(
             EntryCopy(
                 entry_id=entry_id,
+                source_id=entry_id,
                 machine=machine,
-                path=str(path.relative_to(root)),
-                sha256=sha256_bytes(path.read_bytes()),
+                path=relative_path,
+                sha256=digest,
+                source_path=relative_path,
+                source_sha256=digest,
                 status=status,
                 status_source=source,
                 title=title_from_text(text, entry_id),
@@ -412,9 +848,21 @@ def scan_entry_copies(root: Path) -> tuple[list[EntryCopy], list[dict[str, str]]
 
 def build_catalog(root: Path) -> dict[str, Any]:
     root = root.expanduser()
+    with store_lock(root, "catalog-build"):
+        return _build_catalog_locked(root)
+
+
+def _build_catalog_locked(root: Path) -> dict[str, Any]:
     config = load_store_config(root)
     copies, invalid = scan_entry_copies(root)
-    decisions = load_decisions(root)
+    rekey_mappings, rekey_load_invalid = load_rekey_mappings(root)
+    copies, rekey_apply_invalid, applied_rekeys = apply_rekey_mappings(
+        copies, rekey_mappings
+    )
+    rekey_invalid = rekey_load_invalid + rekey_apply_invalid
+    invalid.extend(rekey_invalid)
+    decisions, decision_invalid = load_decisions(root)
+    invalid.extend(decision_invalid)
     grouped: dict[str, list[EntryCopy]] = {}
     for copy in copies:
         grouped.setdefault(copy.entry_id, []).append(copy)
@@ -422,20 +870,45 @@ def build_catalog(root: Path) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     conflict_rows: list[dict[str, Any]] = []
     exact_duplicate_copies = 0
+    acknowledged_conflicts = 0
+    stale_acknowledgements = 0
+    integrity_invalid: list[dict[str, str]] = []
     for entry_id, entry_copies in sorted(grouped.items()):
         hashes = sorted({copy.sha256 for copy in entry_copies})
         exact_duplicate_copies += len(entry_copies) - len(hashes)
         decision = decisions.get(entry_id)
         status = select_status(entry_copies)
         effective_status = str(decision.get("status")) if decision else status
-        conflict = len(hashes) > 1
+        raw_conflict = len(hashes) > 1
+        acknowledgement_requested, copy_set_matches, accepted_copies, ack_error = (
+            decision_copy_acknowledgement(decision, entry_copies)
+        )
+        conflict_acknowledged = raw_conflict and copy_set_matches
+        acknowledgement_stale = acknowledgement_requested and not copy_set_matches
+        conflict = (raw_conflict and not conflict_acknowledged) or acknowledgement_stale
+        if acknowledgement_stale:
+            reason = f"stale accepted_copies for {entry_id}: current copy set changed"
+            if ack_error:
+                reason += f" ({ack_error})"
+            integrity_invalid.append(
+                {
+                    "path": str(decision.get("path") if decision else "decisions"),
+                    "reason": reason,
+                }
+            )
+        acknowledged_conflicts += int(conflict_acknowledged)
+        stale_acknowledgements += int(acknowledgement_stale)
         row = {
             "id": entry_id,
             "title": entry_copies[0].title,
             "status": status,
             "effective_status": effective_status,
-            "actionable": effective_status in ACTIONABLE_STATUSES,
+            "actionable": conflict or effective_status in ACTIONABLE_STATUSES,
             "conflict": conflict,
+            "raw_conflict": raw_conflict,
+            "conflict_acknowledged": conflict_acknowledged,
+            "acknowledgement_stale": acknowledgement_stale,
+            "accepted_copies": accepted_copies,
             "hashes": hashes,
             "machines": sorted({copy.machine for copy in entry_copies}),
             "copies": [copy.__dict__ for copy in entry_copies],
@@ -447,9 +920,50 @@ def build_catalog(root: Path) -> dict[str, Any]:
                 {
                     "id": entry_id,
                     "hashes": hashes,
+                    "accepted_copies": accepted_copies,
+                    "acknowledgement_stale": acknowledgement_stale,
                     "copies": [copy.__dict__ for copy in entry_copies],
                 }
             )
+
+    for entry_id, decision in sorted(decisions.items()):
+        if entry_id in grouped or "accepted_copies" not in decision:
+            continue
+        _, _, accepted_copies, ack_error = decision_copy_acknowledgement(decision, [])
+        reason = f"stale accepted_copies for {entry_id}: all source copies are missing"
+        if ack_error:
+            reason += f" ({ack_error})"
+        integrity_invalid.append({"path": str(decision["path"]), "reason": reason})
+        stale_acknowledgements += 1
+        row = {
+            "id": entry_id,
+            "title": entry_id,
+            "status": "unknown",
+            "effective_status": decision["status"],
+            "actionable": True,
+            "conflict": True,
+            "raw_conflict": False,
+            "conflict_acknowledged": False,
+            "acknowledgement_stale": True,
+            "accepted_copies": accepted_copies,
+            "hashes": [],
+            "machines": [],
+            "copies": [],
+            "decision": decision,
+        }
+        entries.append(row)
+        conflict_rows.append(
+            {
+                "id": entry_id,
+                "hashes": [],
+                "accepted_copies": accepted_copies,
+                "acknowledgement_stale": True,
+                "copies": [],
+            }
+        )
+
+    entries.sort(key=lambda entry: entry["id"])
+    invalid.extend(integrity_invalid)
 
     summary = {
         "entry_files": len(copies),
@@ -458,14 +972,24 @@ def build_catalog(root: Path) -> dict[str, Any]:
         "conflicting_ids": len(conflict_rows),
         "invalid_files": len(invalid),
         "actionable_entries": sum(1 for entry in entries if entry["actionable"]),
+        "rekeys_applied": len(applied_rekeys),
+        "rekey_errors": len(rekey_invalid),
+        "decision_errors": len(decision_invalid),
+        "integrity_errors": len(integrity_invalid),
+        "acknowledged_conflicts": acknowledged_conflicts,
+        "stale_acknowledgements": stale_acknowledgements,
     }
+    generation_id = uuid.uuid4().hex
+    generated_at = utc_now()
     catalog = {
         "schema_version": SCHEMA_VERSION,
-        "generated_at": utc_now(),
+        "generation_id": generation_id,
+        "generated_at": generated_at,
         "store_machine": config["machine"],
         "store_role": config["role"],
         "summary": summary,
         "invalid": invalid,
+        "rekeys": {"applied": applied_rekeys, "invalid": rekey_invalid},
         "entries": entries,
     }
     atomic_write_json(root / "catalog.json", catalog)
@@ -473,7 +997,8 @@ def build_catalog(root: Path) -> dict[str, Any]:
         root / "conflicts.json",
         {
             "schema_version": SCHEMA_VERSION,
-            "generated_at": catalog["generated_at"],
+            "generation_id": generation_id,
+            "generated_at": generated_at,
             "conflicts": conflict_rows,
         },
     )
@@ -483,22 +1008,40 @@ def build_catalog(root: Path) -> dict[str, Any]:
         "",
         "Generated from machine-owned entry files. Do not edit this file directly.",
         "",
+        f"- Generation ID: `{generation_id}`",
         f"- Logical entries: {summary['logical_entries']}",
         f"- Actionable: {summary['actionable_entries']}",
         f"- Conflicting IDs: {summary['conflicting_ids']}",
         f"- Invalid files: {summary['invalid_files']}",
         "",
-        "## Actionable",
+        "## Conflicts requiring review",
         "",
     ]
+    conflict_entries = [entry for entry in entries if entry["conflict"]]
+    if not conflict_entries:
+        active_lines.append("- None.")
+    for entry in conflict_entries:
+        sources = ", ".join(entry["machines"]) or "missing source copies"
+        reason = "STALE ACKNOWLEDGEMENT" if entry["acknowledgement_stale"] else "DIVERGENT COPIES"
+        active_lines.append(
+            f"- [{entry['id']}] {entry['title']} — {entry['effective_status']} "
+            f"({sources}) {reason}"
+        )
+        for copy in entry["copies"]:
+            active_lines.append(f"  - `{copy['path']}` `{copy['sha256']}`")
+    active_lines.extend(["", "## Other actionable", ""])
+    other_actionable = [
+        entry for entry in entries if entry["actionable"] and not entry["conflict"]
+    ]
+    if not other_actionable:
+        active_lines.append("- None.")
     for entry in entries:
-        if not entry["actionable"]:
+        if not entry["actionable"] or entry["conflict"]:
             continue
-        marker = " CONFLICT" if entry["conflict"] else ""
         sources = ", ".join(entry["machines"])
         active_lines.append(
             f"- [{entry['id']}] {entry['title']} — {entry['effective_status']} "
-            f"({sources}){marker}"
+            f"({sources})"
         )
         for copy in entry["copies"]:
             active_lines.append(f"  - `{copy['path']}`")
@@ -506,10 +1049,64 @@ def build_catalog(root: Path) -> dict[str, Any]:
     return catalog
 
 
+def generated_view_errors(base: Path, *, require_all: bool) -> list[str]:
+    """Check that catalog, conflicts, and ACTIVE belong to one publication."""
+    paths = {
+        "catalog": base / "catalog.json",
+        "conflicts": base / "conflicts.json",
+        "active": base / "ACTIVE.md",
+    }
+    present = {name: path.is_file() for name, path in paths.items()}
+    if not any(present.values()) and not require_all:
+        return []
+    errors = [f"missing generated view: {paths[name]}" for name, exists in present.items() if not exists]
+    if errors:
+        return errors
+    try:
+        catalog = read_json(paths["catalog"])
+        conflicts = read_json(paths["conflicts"])
+        active_text = paths["active"].read_text(encoding="utf-8")
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"unreadable generated view under {base}: {exc}"]
+    active_match = ACTIVE_GENERATION_RE.search(active_text)
+    generation_ids = {
+        str(catalog.get("generation_id") or ""),
+        str(conflicts.get("generation_id") or ""),
+        active_match.group("id") if active_match else "",
+    }
+    if "" in generation_ids:
+        return [f"generated view is missing a generation ID under {base}"]
+    if len(generation_ids) != 1:
+        return [
+            f"generated view generation mismatch under {base}: "
+            + ", ".join(sorted(generation_ids))
+        ]
+    return []
+
+
 def validate_store(root: Path, strict: bool) -> tuple[int, dict[str, Any]]:
+    root = root.expanduser()
+    preexisting_errors = generated_view_errors(root, require_all=False)
+    if preexisting_errors:
+        summary: dict[str, Any] = {"view_integrity_errors": len(preexisting_errors)}
+        catalog_path = root / "catalog.json"
+        if catalog_path.is_file():
+            try:
+                existing = read_json(catalog_path)
+                if isinstance(existing.get("summary"), dict):
+                    summary = {**existing["summary"], **summary}
+            except (OSError, json.JSONDecodeError):
+                pass
+        return 1, summary
     catalog = build_catalog(root)
     summary = catalog["summary"]
-    failed = summary["invalid_files"] > 0 or (strict and summary["conflicting_ids"] > 0)
+    post_errors = generated_view_errors(root, require_all=True)
+    summary["view_integrity_errors"] = len(post_errors)
+    failed = (
+        bool(post_errors)
+        or summary["invalid_files"] > 0
+        or (strict and summary["conflicting_ids"] > 0)
+    )
     return (1 if failed else 0), summary
 
 
@@ -546,6 +1143,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     normalize_parser.add_argument("--machine", required=True)
 
+    rekey_parser = subparsers.add_parser(
+        "rekey", help="atomically map one immutable entry copy to a new logical ID"
+    )
+    rekey_parser.add_argument(
+        "--source-path", required=True, help="store-relative entries/<machine>/<file>.md"
+    )
+    rekey_parser.add_argument(
+        "--source-sha256", required=True, help="current SHA-256 of the immutable copy"
+    )
+    rekey_parser.add_argument("--new-id", required=True)
+    rekey_parser.add_argument("--by", default="")
+    rekey_parser.add_argument("--note", default="")
+
     subparsers.add_parser("catalog", help="materialize catalog, conflicts, and ACTIVE.md")
     subparsers.add_parser("status", help="show the actionable fleet learning list")
     validate_parser = subparsers.add_parser("validate", help="validate and summarize the store")
@@ -576,12 +1186,31 @@ def main(argv: Optional[list[str]] = None) -> int:
             result = build_catalog(root)
             print(" ".join(f"{key}={value}" for key, value in result["summary"].items()))
             return 0
+        if args.command == "rekey":
+            path, mapping, created = write_rekey_mapping(
+                root,
+                args.source_path,
+                args.source_sha256,
+                args.new_id,
+                actor=args.by,
+                note=args.note,
+            )
+            build_catalog(root)
+            print(
+                f"rekey={'created' if created else 'existing'} "
+                f"source={mapping['source_path']} new_id={mapping['new_id']} "
+                f"mapping={path}"
+            )
+            return 0
         if args.command == "status":
             path = active_view_path(root)
             if not path.is_file():
                 raise ValueError(
                     f"active view is not available yet: {path}; run collection first"
                 )
+            view_errors = generated_view_errors(path.parent, require_all=True)
+            if view_errors:
+                raise ValueError("; ".join(view_errors))
             sys.stdout.write(path.read_text(encoding="utf-8"))
             return 0
         if args.command == "normalize":

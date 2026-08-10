@@ -43,6 +43,7 @@ if [ "$runner_exit" -ne 0 ] && [ -x "$CODEX_BIN" ]; then
   runner="codex"
   output="$(
     cd "$LEARNINGS_ROOT" && "$CODEX_BIN" exec \
+      --ignore-user-config \
       --ephemeral \
       --skip-git-repo-check \
       -C "$LEARNINGS_ROOT" \
