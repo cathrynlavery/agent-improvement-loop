@@ -13,7 +13,9 @@ BEGIN = "# BEGIN agent-improvement-learnings"
 END = "# END agent-improvement-learnings"
 
 
-def build_block(home: Path, loop_root: Path, remote_hosts: str = "") -> str:
+def build_block(
+    home: Path, loop_root: Path, role: str, remote_hosts: str = ""
+) -> str:
     commands = {
         "harvest": loop_root / "templates/learnings-harvest-run.sh",
         "collect": loop_root / "scripts/collect_learnings_fleet.sh",
@@ -26,16 +28,20 @@ def build_block(home: Path, loop_root: Path, remote_hosts: str = "") -> str:
         if remote_hosts
         else ""
     )
-    return "\n".join(
-        (
-            BEGIN,
-            f'40 18 * * 0 {prefix} /bin/bash "{commands["harvest"]}"',
-            f'10 7 * * * {prefix} {remote_prefix}/bin/bash "{commands["collect"]}"',
-            f'30 7 * * * {prefix} /bin/bash "{commands["fixloop"]}"',
-            f'7 9 1 * * {prefix} /bin/bash "{commands["review"]}"',
-            END,
+    lines = [
+        BEGIN,
+        f'40 18 * * 0 {prefix} /bin/bash "{commands["harvest"]}"',
+    ]
+    if role == "leader":
+        lines.extend(
+            (
+                f'10 7 * * * {prefix} {remote_prefix}/bin/bash "{commands["collect"]}"',
+                f'30 7 * * * {prefix} /bin/bash "{commands["fixloop"]}"',
+                f'7 9 1 * * {prefix} /bin/bash "{commands["review"]}"',
+            )
         )
-    )
+    lines.append(END)
+    return "\n".join(lines)
 
 
 def replace_managed_block(existing: str, block: str) -> str:
@@ -87,14 +93,15 @@ def main() -> int:
     parser.add_argument(
         "--loop-root", default="~/.local/share/agent-improvement-loop"
     )
+    parser.add_argument("--role", choices=("writer", "leader"), required=True)
     parser.add_argument("--remote-hosts", default="")
     args = parser.parse_args()
     home = Path(args.home).expanduser().resolve()
     loop_root = Path(args.loop_root).expanduser().resolve()
-    block = build_block(home, loop_root, args.remote_hosts)
+    block = build_block(home, loop_root, args.role, args.remote_hosts)
     updated = replace_managed_block(read_crontab(), block)
     install_crontab(updated)
-    print("installed=crontab role=leader marker=agent-improvement-learnings")
+    print(f"installed=crontab role={args.role} marker=agent-improvement-learnings")
     return 0
 
 

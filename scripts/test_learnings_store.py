@@ -27,7 +27,9 @@ class LearningsStoreTests(unittest.TestCase):
     def test_cron_managed_block_is_idempotent_and_preserves_other_jobs(self):
         home = Path("/Users/example")
         loop_root = home / ".local/share/agent-improvement-loop"
-        block = cron.build_block(home, loop_root, "silverfox studio mbp ronan")
+        block = cron.build_block(
+            home, loop_root, "leader", "silverfox studio mbp ronan"
+        )
         existing = "0 8 * * * /usr/local/bin/other\n"
         first = cron.replace_managed_block(existing, block)
         second = cron.replace_managed_block(first, block)
@@ -36,6 +38,10 @@ class LearningsStoreTests(unittest.TestCase):
         self.assertIn("collect_learnings_fleet.sh", first)
         self.assertIn("AGENT_LEARNINGS_REMOTE_HOSTS='silverfox studio mbp ronan'", first)
         self.assertEqual(first.count(cron.BEGIN), 1)
+
+        writer = cron.build_block(home, loop_root, "writer")
+        self.assertIn("learnings-harvest-run.sh", writer)
+        self.assertNotIn("collect_learnings_fleet.sh", writer)
 
     def test_launchd_writer_and_leader_roles(self):
         home = Path("/Users/example")

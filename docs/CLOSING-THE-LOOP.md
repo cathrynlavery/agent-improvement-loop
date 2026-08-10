@@ -67,3 +67,7 @@ Use `scripts/install_learnings_launchd.py` on Macs with a logged-in GUI session.
 For an always-headless leader with no `gui/<uid>` launchd domain, use
 `scripts/install_learnings_cron.py`; it owns only the marked learnings block and
 preserves unrelated crontab entries.
+
+The leader must have an authenticated headless agent runtime. A machine without
+one remains a writer; do not schedule a collector/fixloop there just because it is
+always online.
