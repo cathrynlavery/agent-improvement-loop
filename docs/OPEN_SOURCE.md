@@ -12,7 +12,7 @@ Keep the public repo limited to:
 - public-safe examples using synthetic data
 - documentation that teaches the workflow without naming private people, customers, accounts, or internal projects
 
-The public repo may explain that the tool mines local personal/work transcripts. That is the point. It must also be clear that transcript mining is local and that content proposals are source material for review, not publishable copy.
+The public repo may explain that the tool mines local personal/work transcripts. That is the point. It must also be clear that transcript mining stays local and only redacted improvement proposals cross machine boundaries.
 
 ## What belongs in a private fork or private overlay
 
@@ -22,37 +22,16 @@ Use a private fork or ignored local files for:
 - copied logs from other machines
 - private detector catalogs for your own tools, clients, accounts, and internal workflows
 - receipts, dogfood output, screenshots, or examples that contain private context
-- any proposed content brief that names real customers, family members, private accounts, health/school/daycare details, auth material, or exact business metrics
 
 Recommended local layout:
 
 ```text
 agent-improvement-loop/
   private/                         # gitignored
-    content-workflows.local.json    # private detector ideas / patterns
+    detectors.local.json            # private detector ideas / patterns
     dogfood-runs/                   # local real-session outputs
   .agent-improvement/               # gitignored queue/output root if run in-tree
 ```
-
-## Content route privacy rule
-
-`content_idea` is allowed to mine personal/private sessions locally. That is useful: the best content often comes from real work.
-
-But content output must be treated as **source material**, not publishable text:
-
-1. Keep evidence references; do not dump full transcripts.
-2. For high-risk ideas, suppress command and excerpt text.
-3. Use synthetic examples in public drafts.
-4. Remove names, emails, phone numbers, customer/client details, family details, health details, auth material, exact private metrics, and raw messages.
-5. Keep `recommendation=needs_context` for high-risk proposals until the owner approves the abstraction.
-
-The current code enforces this by replacing high-risk content evidence with:
-
-```text
-<private workflow evidence redacted>
-```
-
-That suppression applies even when `--full` is used.
 
 ## Release checklist before sharing publicly
 

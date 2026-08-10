@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-improvement-loop"
 version = "0.3.0"
-description = "Mine local Claude Code and Codex sessions for approval-gated self-improvement proposals."
+description = "Mine local agent sessions for approval-gated self-improvement proposals."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

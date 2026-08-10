@@ -63,27 +63,28 @@ class LearningsStoreTests(unittest.TestCase):
             harvest_minute=40,
             remote_hosts="desktop laptop notebook mini",
         )
-        self.assertEqual(set(writer), {"ai.openclaw.learnings-harvest"})
+        prefix = "io.agent-improvement-loop"
+        self.assertEqual(set(writer), {f"{prefix}.learnings-harvest"})
         self.assertEqual(
             set(leader),
             {
-                "ai.openclaw.learnings-harvest",
-                "ai.openclaw.learnings-collect",
-                "ai.openclaw.learnings-fixloop",
-                "ai.openclaw.learnings-review",
+                f"{prefix}.learnings-harvest",
+                f"{prefix}.learnings-collect",
+                f"{prefix}.learnings-fixloop",
+                f"{prefix}.learnings-review",
             },
         )
-        collect_env = leader["ai.openclaw.learnings-collect"]["EnvironmentVariables"]
+        collect_env = leader[f"{prefix}.learnings-collect"]["EnvironmentVariables"]
         self.assertEqual(collect_env["AGENT_LEARNINGS_REMOTE_HOSTS"], "desktop laptop notebook mini")
         self.assertEqual(
-            writer["ai.openclaw.learnings-harvest"]["StartCalendarInterval"]["Minute"],
+            writer[f"{prefix}.learnings-harvest"]["StartCalendarInterval"]["Minute"],
             20,
         )
 
     def test_instruction_update_replaces_legacy_path_and_is_idempotent(self):
         legacy = (
             "# Rules\n\n- Self-improvement: append to "
-            "~/Library/CloudStorage/Dropbox/OpenClaw/.learnings/.\n"
+            "~/old-agent-learnings/.\n"
         )
         updated = instruction.update_text(legacy)
         self.assertIn("~/.agents/learnings/config.json", updated)

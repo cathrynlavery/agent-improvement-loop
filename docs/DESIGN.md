@@ -4,7 +4,7 @@ A conservative first implementation of a daily session-mining loop.
 
 ## Four phases
 
-1. **Collect** local Claude Code and Codex transcripts.
+1. **Collect** local Claude Code, Codex, and Hermes transcripts.
 2. **Normalize** them into a small, redacted event model.
 3. **Detect** reusable improvement signals.
 4. **Stage** proposals for an interactive review/apply turn.
@@ -13,7 +13,7 @@ Only the first three are safe to automate. The apply phase stays approval-gated 
 
 ## Normalized session
 
-Every transcript reduces to tool calls, CLI invocations, skill invocations, failures, corrections, and slash commands, with evidence stored as references plus short redacted excerpts, never full transcript dumps.
+Every transcript reduces to tool calls, CLI invocations, skill invocations, failures, and corrections, with evidence stored as references plus short redacted excerpts, never full transcript dumps.
 
 ## Detectors
 
@@ -32,7 +32,6 @@ Every transcript reduces to tool calls, CLI invocations, skill invocations, fail
 - `skill_improvement`: a skill was invoked and the same session later contains a correction. Prefer patching the existing skill.
 - `memory_context`: corrections not tied to a skill, grouped per project (`cwd`) and capped per session, so one busy session cannot flood the packet. Promote only durable preferences or runbook facts.
 - `backlog`: repeated general-tool failures across sessions, plus recurring attributable silent-empty results from general data-fetch commands. Subagent transcripts are excluded by default (exploratory subagents fail by design), and ambiguous code-runtime inputs are skipped because there is no single shell executable to blame. Decide durable vs transient before creating a task.
-- `content_idea`: real workflows or moments worth considering for public content. Stage editorial proposals with audience, outline, last30days query, confidence, recommendation, and privacy notes; never draft or publish automatically. Detectors include high-signal slash commands, command-level workflow clusters, private-build signals, and aggregate usage stories such as top skills, most-used CLI tools, loop examples, and slash-command roundups when transcript data contains them.
 
 Proposal IDs are deterministic from route, target, and evidence references, so daily scans avoid restaging the same item unless `--include-seen` is passed.
 
@@ -67,7 +66,6 @@ Detector knobs live in an optional JSON config (`~/.agent-improvement/config.jso
 
 - Redact emails, phone numbers, auth headers, cookies, API keys, tokens, cloud/SaaS key shapes (Stripe, Slack, Google, GitHub, GitLab, npm, AWS), private-key blocks, JWTs, and long opaque token-like strings before writing excerpts. A corpus test asserts secret shapes never survive redaction.
 - Store evidence references and short excerpts, not whole transcripts.
-- For `content_idea`, treat real sessions as private source material. High-risk content evidence suppresses command/excerpt text even under `--full`; public drafts should use abstractions or synthetic examples.
 - Keep public detector logic generic. Put private detector catalogs, local logs, and real dogfood output in an ignored `private/` directory or a private fork.
 - Treat transcript scaffolding as non-user text.
 - Keep scan/stage automation separate from apply automation.

@@ -1,6 +1,6 @@
 # agent-improvement-loop
 
-**Self-improvement for you and your AI agents.** A small, local, safe daily loop that mines your Claude Code and Codex sessions for reusable improvements, then stages them for your approval.
+**Self-improvement for you and your AI agents.** A small, local, safe daily loop that mines Claude Code, Codex, and Hermes sessions for reusable improvements, then stages them for your approval.
 
 It never changes anything on its own. It reads your transcripts, finds the friction you keep hitting, redacts anything sensitive, and writes a review packet of staged proposals. You decide what to apply.
 
@@ -8,11 +8,10 @@ The idea: most people point AI at their work. The higher-leverage first loop poi
 
 ## What it does
 
-1. **Collect** local Claude Code (`~/.claude/projects/**/*.jsonl`) and Codex (`~/.codex/sessions/**/*.jsonl`) transcripts from one or more home directories.
-2. **Normalize** each into a small, redacted event model (tool calls, shell commands, skill use, failures, corrections, slash commands).
+1. **Collect** local Claude Code (`~/.claude/projects/**/*.jsonl`), Codex (`~/.codex/sessions/**/*.jsonl`), and Hermes profile transcripts from one or more home directories.
+2. **Normalize** each into a small, redacted event model (tool calls, shell commands, skill use, failures, and corrections).
 3. **Detect** reusable improvement signals from _actual tool usage_, not prose mentions. If you typed "don't use that CLI," that sentence is not counted as the CLI failing.
-4. **Detect** grounded content ideas from real workflows, slash commands, and private-build signals, then stage them for editorial review.
-5. **Stage** proposals and a human-readable review packet under `~/.agent-improvement/`.
+4. **Stage** proposals and a human-readable review packet under `~/.agent-improvement/`.
 
 It does **not** edit skills, memory, runbooks, config, or source code. Scan and stage are automated. Apply stays manual.
 
@@ -49,16 +48,13 @@ agent-improvement-loop --since-days 1
 # Preview as JSON without writing the queue
 ./bin/daily-improvement-loop --since-days 1 --dry-run
 
-# Stage only content ideas grounded in real session evidence
-./bin/daily-improvement-loop --route content_idea --since-days 7
-
 # Include logs copied from other machines
-./bin/daily-improvement-loop --home ~/.agent-logs/laptop --extra-home ~/.agent-logs/desktop --route content_idea
+./bin/daily-improvement-loop --home ~/.agent-logs/laptop --extra-home ~/.agent-logs/desktop
 
 # Close a fixed target, inspect the registry, or reopen it
-./bin/daily-improvement-loop --resolve "tool:cloudflare-pp-cli" --decision fixed --pr 71 --note "Merged and verified"
+./bin/daily-improvement-loop --resolve "tool:edge-cli" --decision fixed --pr 71 --note "Merged and verified"
 ./bin/daily-improvement-loop --list-resolutions
-./bin/daily-improvement-loop --unresolve "tool:cloudflare-pp-cli"
+./bin/daily-improvement-loop --unresolve "tool:edge-cli"
 ```
 
 | Flag                                     | Meaning                                                                                                                                                                            |
@@ -66,11 +62,10 @@ agent-improvement-loop --since-days 1
 | `--since-days N`                         | Scan sessions modified within N days                                                                                                                                               |
 | `--all`                                  | Backfill every discovered session                                                                                                                                                  |
 | `--max-sessions N`                       | Keep only the most recent N after filtering                                                                                                                                        |
-| `--source {all,claude,codex,hermes_profile_log,paperclip_run}` | Which local session source to read (default `all`)                                                                                                              |
+| `--source {all,claude,codex,hermes_profile_log}` | Which local session source to read (default `all`)                                                                                                                            |
 | `--machine NAME`                         | Stable fleet machine name embedded in sessions, proposals, and redacted bundle metadata                                                                                            |
 | `--collect-fleet`                        | Merge the latest redacted bundle per machine from `--fleet-inbox` into one fleet review packet                                                                                     |
 | `--fleet-inbox PATH`                     | Root containing `<machine>/<run-id>.json` redacted bundles for `--collect-fleet`                                                                                                    |
-| `--route {all,improvement,content_idea}` | Stage operational improvements, content ideas, or both (default `improvement`)                                                                                                     |
 | `--include-seen`                         | Re-emit proposals even if their key was seen before                                                                                                                                |
 | `--include-resolved`                     | Debug bypass for the resolutions registry; seen-key filtering still applies unless `--include-seen` is also passed                                                                |
 | `--resolve ROUTE:TARGET`                 | Record a target resolution; requires `--decision`, with optional `--pr`, `--note`, `--by`, and `--resolved-at`                                                                    |
@@ -86,7 +81,6 @@ agent-improvement-loop --since-days 1
 | `--extra-home PATH`                      | Additional home dir containing `.claude` / `.codex`, useful for logs copied from another Mac                                                                                       |
 | `--output-root PATH`                     | Where to write the queue (default `~/.agent-improvement`)                                                                                                                          |
 | `--config PATH`                          | JSON config overriding detector defaults (default `~/.agent-improvement/config.json`; see "Configuration")                                                                         |
-| `--printing-press-root PATH`             | Root of your printing-press CLI tree, so a `tool` proposal points at the matching CLI source and the amend/reprint workflow (default `~/printing-press`, or `PRINTING_PRESS_ROOT`) |
 
 ## Output
 
@@ -141,7 +135,7 @@ The registry is a human-editable JSON object keyed by `route:target`:
 
 ```json
 {
-  "tool:cloudflare-pp-cli": {
+  "tool:edge-cli": {
     "decision": "fixed",
     "resolved_at": "2026-07-16T22:37:19+00:00",
     "pr": "71",
@@ -166,7 +160,7 @@ Fix workflows can import a batch handoff with `--resolve-from decisions.json`. T
   "decisions": [
     {
       "proposal_id": "imp-c84cfef007115f5d918a",
-      "target": "tool:cloudflare-pp-cli",
+      "target": "tool:edge-cli",
       "decision": "fixed",
       "resolved_at": "2026-07-16T22:37:19Z",
       "pr": "71",
@@ -194,7 +188,16 @@ Migrate an existing store non-destructively:
 ```sh
 ./bin/learnings-store --root ~/.agents/learnings migrate \
   --machine desktop \
-  --source ~/Library/CloudStorage/Dropbox/OpenClaw/.learnings
+  --source ~/path/to/legacy-learnings
+```
+
+Peer bootstrap initializes a fresh local store by default. To import an existing
+store on the peer during its first bootstrap, set a peer-local absolute path or a
+path relative to its home directory:
+
+```sh
+AGENT_LEARNINGS_LEGACY_SOURCE=.legacy-agent-learnings \
+  ./scripts/bootstrap_learnings_peer.sh laptop laptop
 ```
 
 Every entry is machine-owned and collision-resistant:
@@ -274,8 +277,6 @@ The legacy source remains untouched. Remove it only after every machine has run
 live capture, collection, and leader triage successfully for an agreed retention
 period.
 
-For `content_idea`, personal/private sessions are allowed as local source material, but the public output is intentionally conservative: high-risk content evidence suppresses command and excerpt text even when `--full` is enabled. Use the idea as a starting point, then remove names, raw messages, customer/client details, family details, auth material, exact private metrics, and any other identifying specifics before drafting or publishing.
-
 ### From staged proposals to executed fixes
 
 Staging is half the loop. The other half — a scheduled headless triage pass that promotes/resolves/queues, and an interactive `learn-loop` session that executes the queue with test gates and closes every entry's status — is documented in [docs/CLOSING-THE-LOOP.md](docs/CLOSING-THE-LOOP.md), with a ready-to-adapt skill (`skills/learn-loop/`), the triage prompt and runner shim (`templates/`), and a LaunchAgent example (`examples/`).
@@ -284,17 +285,16 @@ Staging is half the loop. The other half — a scheduled headless triage pass th
 
 This repo should stay public-safe. Put private detector catalogs, copied logs, real run outputs, receipts, and dogfood artifacts in a private fork or ignored local files such as `private/` and `.agent-improvement/`.
 
-See [`docs/OPEN_SOURCE.md`](docs/OPEN_SOURCE.md) for the public/private split, release checklist, and content privacy rules.
+See [`docs/OPEN_SOURCE.md`](docs/OPEN_SOURCE.md) for the public/private split and release checklist.
 
 ## The routes (where a fix belongs)
 
 The hard part is not noticing. It is deciding what kind of lesson you found. Proposals are routed to one of:
 
-- **`tool`** — a CLI failed _or got stuck_ on you in real use. Fix the tool, not the prompt. (By default it recognizes CLIs named `*-pp-cli`; see "Configuration" below.) Four kinds of friction are caught: hard **failures** (explicit `is_error` or non-zero exit), **hang/timeout** signals where the command actually stalled without a clean result, **retry-before-success** — repeated use corroborated by a failure/hang or same-subcommand flag variation that looks like syntax guessing — and **silent empty results** where a data-returning call exits cleanly with `[]`, `{}`, `null`, empty stdout, `0 rows`, `No results`, or `(empty)` and the agent continues without acknowledging the emptiness. The proposal summary breaks down which kinds fired and how many retries it took. For a printing-press CLI (resolved against `--printing-press-root`), the suggested action also names the source directory and points you at `/printing-press-amend` or `/printing-press-reprint`. Recurring MCP failures and swallowed empty results route here too, grouped per server (`mcp:<server>`).
+- **`tool`** — a CLI failed _or got stuck_ on you in real use. Fix the tool, not the prompt. (By default it recognizes CLIs named `*-cli`; see "Configuration" below.) Four kinds of friction are caught: hard **failures** (explicit `is_error` or non-zero exit), **hang/timeout** signals where the command actually stalled without a clean result, **retry-before-success** — repeated use corroborated by a failure/hang or same-subcommand flag variation that looks like syntax guessing — and **silent empty results** where a data-returning call exits cleanly with `[]`, `{}`, `null`, empty stdout, `0 rows`, `No results`, or `(empty)` and the agent continues without acknowledging the emptiness. The proposal summary breaks down which kinds fired and how many retries it took. Recurring MCP failures and swallowed empty results route here too, grouped per server (`mcp:<server>`).
 - **`skill_improvement`** — a reusable skill/command was used and the session later contained a correction. Patch the existing skill before creating a new one. Corrections that happened before the skill was invoked are treated as task context, not evidence that the skill failed.
 - **`memory_context`** — a durable correction not tied to a skill, grouped per project (`cwd`) so the review question is "what line in _this_ project's `CLAUDE.md` / `AGENTS.md` or runbook would have prevented this". Corrections are detected conservatively: explicitly corrective phrases count in normal-length messages, while ambient words like "do not" or "instead" only count in short reactive messages — a long task brief that says "do NOT change X" is an instruction, not a correction.
 - **`backlog`** — repeated general-tool failures worth tracking but not urgent, plus recurring high-confidence swallowed empty results from general data-fetch commands. Both are staged with evidence instead of a vague note. Failures and silent-empty results inside subagent transcripts are excluded by default (exploratory subagents fail by design while probing).
-- **`content_idea`** — a real workflow or moment that may be useful public content. The MVP detects repeated/high-value slash command usage, command-level workflow clusters (task-ledger, executive-assistant, and revenue-watch loops), aggregate usage stories (`top skills`, command-line stack, most-used slash commands when present), and private-build signals such as message/search/CRM workflows. These proposals include content type, audience, rough outline, suggested `/last30days` query, confidence, recommendation, and privacy/redaction notes. They are editorial staging only: no drafting, posting, or publishing.
 
 And the most important non-route: **nothing.** One-off failures (a VPN was off) are discarded, not encoded. A system that cannot throw a lesson away turns into a haunted house of old warnings.
 
@@ -348,20 +348,17 @@ Detector defaults can be overridden without editing code. Put a JSON file at
 
 | Key                             | Meaning                                                                                  |
 | ------------------------------- | ---------------------------------------------------------------------------------------- |
-| `tracked_cli_suffix`            | Command-name suffix the `tool` route tracks (default `-pp-cli`)                          |
+| `tracked_cli_suffix`            | Command-name suffix the `tool` route tracks (default `-cli`)                          |
 | `extra_scaffold_markers`        | Strings that mark injected/scaffolded user messages your own automation inserts          |
 | `extra_redaction_patterns`      | `[regex, replacement]` pairs appended to the built-in secret masks                       |
 | `extra_backlog_ignore`          | Executables the `backlog` route should never blame                                       |
 | `extra_remote_command_wrappers` | Wrappers (like your ssh helper) whose quoted commands should be scanned for tracked CLIs |
 | `include_subagent_failures`     | Count failure/silent-empty signals from subagent transcripts (default `false`)            |
-| `validate_pp_cli_candidates`    | Drop code-literal-only CLI names missing from an available source tree (default `true`)  |
 | `detect_silent_empty`           | Detect swallowed structurally empty data results (default `true`)                        |
 | `silent_empty_fetch_verbs`      | Extra command/subcommand verbs that clearly intend to return data                        |
 | `silent_empty_ignore`           | Executables whose empty output should always be treated as normal success                 |
 
 General tool failures are still captured by the `backlog` route regardless of the tracked suffix.
-
-If your CLI sources live somewhere other than `~/printing-press`, pass `--printing-press-root PATH` (or set `PRINTING_PRESS_ROOT`). The loop maps `<name>-pp-cli` to the first of `<root>/library/<name>`, `<root>/manuscripts/<name>`, or `<root>/<name>` that exists on disk; if none exist, the proposal simply omits the source line.
 
 ## Limitations — what it won't catch
 

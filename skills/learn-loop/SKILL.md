@@ -1,122 +1,115 @@
 ---
 name: learn-loop
-description: "Interactive fix loop over a machine-local fleet learnings store. Surveys the published catalog and fix queue, plans a bounded batch for approval, executes and verifies fixes, then records immutable decisions without editing evidence. Use when the user says 'learn loop', 'work the fix queue', 'go through the learnings', or 'what should we be improving'."
+description: "Close captured agent-improvement work: triage fleet learnings, select a bounded evidence-backed batch, implement and live-verify fixes, and record leader decisions. Use for 'learn loop', 'fix the learnings', 'process the backlog', or when asked what recurring agent/tool friction to improve."
 ---
 
 # Learn Loop
 
-Execute the improvement loop end to end: survey → plan → approve → fix → verify → decide. The scheduled headless pass may promote a safe rule, resolve an evidenced outcome, or queue work. This interactive skill performs real code and operational fixes.
+Turn captured friction into verified system improvements:
 
-The canonical store is `${AGENT_LEARNINGS_ROOT:-~/.agents/learnings}`. It is a machine-local data store, not necessarily a Git repository. Machine-owned files under `entries/` are immutable evidence. Durable outcomes belong in leader-owned `decisions/`; ID corrections belong in `rekeys/`.
+`survey → select → approve → fix → verify → decide`
 
-## Phase 1 — Survey
+The canonical store is `${AGENT_LEARNINGS_ROOT:-~/.agents/learnings}`. Machine-owned files under `entries/` are immutable evidence. Effective outcomes live in leader-owned `decisions/`; ID corrections live in `rekeys/`.
 
-1. Read `config.json`. Survey is allowed on any machine; mutations require `role: leader`.
-2. Run `learnings status`. Treat a missing or mixed-generation view as a hard stop.
-3. Read `ACTIVE.md`, `catalog.json`, `conflicts.json`, `queue/FIX-QUEUE.md`, and prior `reviews/FIX-PLAN-*-RESULTS.md` files. On a writer, use the generated files under `fleet/` and move execution to the leader.
-4. Read every evidence copy referenced by the candidate logical entries. Never infer a fleet decision from one machine's copy.
-5. Check loop health before trusting the backlog:
-   - Recent harvest, collection, and fixloop RUN lines must exist under `~/Library/Logs`.
-   - The leader must have an authenticated unattended runtime.
-   - `catalog.json` must report zero invalid files, stale acknowledgements, and rekey errors before mutation.
-6. Check current state for `in_progress` items with a PR or external dependency. A merged PR is not resolved until the shipped behavior is verified.
+## Modes
 
-## Phase 2 — Plan and approve
+- **Survey** — recommend what to fix without changing code or store outcomes.
+- **Fix** — execute an approved bounded batch through verification and decision.
+- **Reconcile** — resolve divergent-copy conflicts. Read [STORE-PROTOCOL.md](STORE-PROTOCOL.md) before any store mutation.
+- **Resume** — continue an existing plan or PR from current state; do not repeat completed work.
 
-Write `reviews/FIX-PLAN-<YYYYMMDD>.md` with the current catalog generation and at most three independently verifiable work items for an inline approval. Larger plans require explicit approval before execution.
+## 1. Pin the snapshot
 
-Bucket each item as:
+1. Read `config.json` and run `learnings status`.
+2. Use `ACTIVE.md`, `catalog.json`, and `conflicts.json` on the leader; on a writer, use `fleet/` for survey and move mutations to the leader.
+3. Stop store mutation when generated views disagree or the catalog reports invalid files, stale acknowledgements, rekey errors, decision errors, or integrity errors.
+4. Read the fix queue and prior `FIX-PLAN-*-RESULTS.md` files. Re-check live PRs and external dependencies instead of trusting their recorded status.
+5. When the request concerns loop health, check recent harvest, collection, and triage run lines plus the leader's unattended runtime.
 
-- **Promotion** — a durable rule in an instruction, skill, hook, wrapper, or test. Prefer mechanical enforcement over prose.
-- **Code fix** — one repository, ownership boundary, test gate, and PR target.
-- **Operational** — scheduler, configuration, quarantine, migration, or live-system repair.
-- **Conflict reconciliation** — compatible copies to acknowledge or unrelated incidents to rekey.
-- **Blocked on the user** — credentials, payment, merge approval, factual judgment, or destructive action.
+**Snapshot complete when:** one healthy catalog generation is pinned and every previously touched candidate is classified as finished, still active, or superseded.
 
-Rank by recurrence across machines, severity, enforceability, and verification cost. Do not optimize for closing the largest number of entries.
+## 2. Pass the evidence gate
 
-## Phase 3 — Execute
+For each candidate, read every referenced evidence copy and inspect the current target. A title or aggregate row is a pointer, not proof.
 
-Capture the current generation ID from `ACTIVE.md` immediately before every leader mutation. Each successful mutation publishes a new generation, so refresh it before the next mutation.
+Assign exactly one disposition:
 
-### Safe store commands
+- **Promote** — encode a durable rule in an existing instruction, skill, test, hook, or wrapper.
+- **Code fix** — change one repository with a named test and shipping target.
+- **Operational fix** — repair a scheduler, configuration, migration, or live integration.
+- **Reconcile** — acknowledge compatible copies or rekey unrelated incidents.
+- **Close without change** — duplicate, stale, already fixed, one-off, or intentionally declined.
+- **Blocked** — requires credentials, payment, destructive authority, merge approval, or unresolved human judgment.
 
-Generate a machine-derived, high-entropy ID for new evidence or a fresh rekey target:
+Rank candidates by recurrence across machines, severity, enforceability, and verification cost. Select at most three unless the user approves a larger batch.
 
-```sh
-learnings new-id --type ERR
-```
+In Survey mode, present the ranked recommendation and stop here without writing a plan or outcome. In Fix or Reconcile mode, write `reviews/FIX-PLAN-<date>.md`; add a short sequence or topic suffix when that day's path already exists.
 
-On the leader, add `--machine <source-machine>` when generating a fresh rekey
-target for a collected peer copy. Writers cannot generate IDs for another machine.
+The plan records:
 
-Record an ordinary outcome only when the logical entry is not conflicted:
+- pinned catalog generation;
+- current and desired behavior per item;
+- independently checkable acceptance criteria;
+- explicit out-of-scope boundaries;
+- target repository or live surface.
 
-```sh
-learnings decide \
-  --id ERR-YYYYMMDD-MACHINETOKEN \
-  --status in_progress \
-  --catalog-generation <generation-from-ACTIVE> \
-  --by learn-loop \
-  --note "Implemented and tested; awaiting merge" \
-  --target <PR-or-file> \
-  --evidence <test-or-live-receipt>
-```
+An explicit request to execute named work is approval for that scope. Otherwise present the plan and wait.
 
-Split one unrelated source copy without renaming or editing its evidence:
+**Evidence gate passes when:** every selected item has current proof, a single disposition, acceptance criteria, scope boundaries, and approval.
 
-```sh
-learnings rekey \
-  --source-path entries/<machine>/<machine>--<old-ID>.md \
-  --source-sha256 <exact-source-sha256> \
-  --new-id <fresh-ID> \
-  --catalog-generation <generation-from-ACTIVE> \
-  --by learn-loop \
-  --note "Human-reviewed same-ID collision" \
-  --confirm-split
-```
+## 3. Execute the smallest effective change
 
-Add `--alias-existing` only when the reviewed source is genuinely another copy of an existing logical incident.
+Follow each target repository's instructions and preserve unrelated work. Prefer the narrowest durable enforcement seam: test or wrapper, then skill or instruction when mechanical enforcement is not available.
 
-Acknowledge compatible divergent copies only after reading every current copy:
+Keep source-repository changes separate from the learnings store. Store evidence records what happened; source commits and PRs change the system.
 
-```sh
-learnings acknowledge-conflict \
-  --id <logical-ID> \
-  --status <status> \
-  --catalog-generation <generation-from-ACTIVE> \
-  --by learn-loop \
-  --note "Reviewed all current copies; differences are compatible provenance" \
-  --confirm-compatible
-```
+When independent lanes are safe, use the concurrency available in the environment with one owner per deliverable path. Store mutations remain serial because every changed mutation publishes a new generation.
 
-The command records the exact source path and SHA-256 set. A changed, added, or deleted copy automatically makes the acknowledgement stale and reopens the conflict. Use `--replace` only after reading the existing decision and intentionally superseding it.
+**Execution complete when:** the requested behavior is implemented, scoped, and ready for its declared verification—not merely when files changed.
 
-### Fix execution
+## 4. Pass the ship gate
 
-- Use isolated worktrees and parallel workers when the environment supports them; otherwise execute sequentially. Keep exactly one owner per deliverable path.
-- Read governing repository instructions and current state before edits.
-- Run every declared test gate from the orchestrator environment. Treat sandbox or missing-tool failures as unverified, not as product failures.
-- Exercise the real surface when safe. Verify subject identity as well as command success.
-- Keep source-repository commits and PRs separate from the learnings store. Never assume the store itself should be committed or pushed.
+Verification must name the observation:
 
-## Phase 4 — Close the loop
+- run focused tests while iterating and the full relevant suite at the end;
+- exercise the real command, app, schedule, or integration when safe;
+- verify the correct account, machine, environment, and deployed version;
+- scan the full diff before a public PR for private names, paths, identifiers, credentials, and real evidence;
+- when runtime or store behavior changed, publish one generation and confirm `learnings status` on every reachable machine.
 
-1. Never edit `entries/`, `legacy/`, `ACTIVE.md`, `catalog.json`, or `conflicts.json` directly.
-2. Record every touched outcome with `learnings decide` or `learnings acknowledge-conflict`:
-   - `resolved` or `promoted` only after verified completion.
-   - `in_progress` for an open PR or implemented-but-unverified fix.
-   - `blocked` or `deferred` with a factual reason when appropriate.
-3. Remove or check off completed queue lines; retain blocked and in-progress work with current references.
-4. Write `reviews/FIX-PLAN-<YYYYMMDD>-RESULTS.md`, one row per item: `done-verified`, `done-unverified`, `blocked`, or `skipped`, with evidence.
-5. Rebuild and validate the leader catalog, run collection, then confirm `learnings status` succeeds on every reachable writer with the same generation.
-6. Report shipped PRs, verified outcomes, blockers, and everything deliberately left open.
+An open PR is `in_progress`. A merged change without live proof is still unverified. Record that honestly instead of closing it.
+
+**Ship gate passes when:** every acceptance criterion has a test, receipt, URL, catalog summary, or explicit `unverified` result.
+
+## 5. Pass the decision gate
+
+Read [STORE-PROTOCOL.md](STORE-PROTOCOL.md) before recording outcomes or reconciling conflicts.
+
+For every selected item:
+
+1. Record the effective status and evidence through the leader CLI.
+2. Refresh the generation after each changed mutation.
+3. Remove completed queue lines; retain active or blocked work with its current reference.
+4. Write `reviews/FIX-PLAN-<date>-RESULTS.md` with one row per item: `done-verified`, `done-unverified`, `blocked`, or `skipped`.
+5. Rebuild, validate, collect, and confirm one fleet generation when the store changed.
+
+**Decision gate passes when:** every touched item has one durable outcome, queue state matches reality, and generated views are healthy.
+
+## 6. Report the handoff
+
+Lead with the outcome. Report:
+
+- shipped commits and PRs;
+- verification evidence;
+- items deliberately left open and why;
+- user action required, if any.
+
+The final report must stand alone; commentary and private evidence are not part of the handoff.
 
 ## Guardrails
 
-- Never invent a fix or status from a title alone; read the evidence copies and current target state.
-- Never resolve a divergent-copy conflict with `decide`; acknowledge compatible copies or rekey unrelated incidents.
-- Live business surfaces require a read-before-write check and the narrowest safe mutation.
-- Quarantined tools remain quarantined until their fixes merge and pass live verification.
-- Public changes require a full-diff privacy scan with synthetic examples and generic machine/account names.
-- Never put secrets, credentials, unnecessary PII, or private evidence in commands, logs, decisions, plans, or PRs.
+- Evidence remains immutable; decisions and rekeys carry interpretation.
+- Compatible-copy acknowledgement binds to the exact current path-and-hash set.
+- Public artifacts use synthetic examples and generic machine, account, project, and tool names.
+- Live writes begin from current state and use the narrowest safe mutation.
+- Credentials, secrets, raw transcripts, unnecessary PII, and private evidence stay out of commands, logs, decisions, plans, commits, and PRs.

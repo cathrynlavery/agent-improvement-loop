@@ -1,0 +1,5 @@
+interface:
+  display_name: "Learn Loop"
+  short_description: "Turn captured agent friction into verified fixes"
+policy:
+  allow_implicit_invocation: true

@@ -9,6 +9,7 @@ ROLE="${3:-writer}"
 HARVEST_MINUTE="${4:-30}"
 LOOP_ROOT="${AGENT_IMPROVEMENT_ROOT:-$HOME/.local/share/agent-improvement-loop}"
 LEARNINGS_ROOT="${AGENT_LEARNINGS_ROOT:-$HOME/.agents/learnings}"
+LEGACY_SOURCE="${AGENT_LEARNINGS_LEGACY_SOURCE:-}"
 MARKER="$LEARNINGS_ROOT/fleet/bootstrap-$MACHINE.complete"
 RUN_LOG="$HOME/Library/Logs/learnings-bootstrap-$MACHINE.log"
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -62,16 +63,23 @@ if [ -f "$HOME/.agents/.gitignore" ]; then
   rsync -a "$HOME/.agents/.gitignore" "$REMOTE_HOST:.agents/.gitignore" >> "$RUN_LOG" 2>&1 || exit 1
 fi
 
-ssh "$REMOTE_HOST" /bin/bash -s -- "$MACHINE" "$ROLE" "$HARVEST_MINUTE" >> "$RUN_LOG" 2>&1 <<'REMOTE_BOOTSTRAP'
+ssh "$REMOTE_HOST" /bin/bash -s -- \
+  "$MACHINE" "$ROLE" "$HARVEST_MINUTE" "$LEGACY_SOURCE" \
+  >> "$RUN_LOG" 2>&1 <<'REMOTE_BOOTSTRAP'
 set -u
 machine="$1"
 role="$2"
 harvest_minute="$3"
+legacy_source="$4"
 loop_root="$HOME/.local/share/agent-improvement-loop"
 store="$HOME/.agents/learnings"
-legacy="$HOME/Library/CloudStorage/Dropbox/OpenClaw/.learnings"
+case "$legacy_source" in
+  '') legacy='' ;;
+  /*) legacy="$legacy_source" ;;
+  *) legacy="$HOME/$legacy_source" ;;
+esac
 
-if [ ! -f "$store/config.json" ] && [ -d "$legacy" ]; then
+if [ ! -f "$store/config.json" ] && [ -n "$legacy" ] && [ -d "$legacy" ]; then
   "$loop_root/bin/learnings-store" --root "$store" migrate \
     --machine "$machine" --source "$legacy" --role "$role"
 else
@@ -83,12 +91,13 @@ python3 "$loop_root/scripts/update_learnings_instruction.py" "$HOME/.codex/AGENT
 
 uid="$(id -u)"
 if launchctl print "gui/$uid" >/dev/null 2>&1; then
+  launch_label="io.agent-improvement-loop.learnings-harvest"
   python3 "$loop_root/scripts/install_learnings_launchd.py" \
     --home "$HOME" --role "$role" --harvest-minute "$harvest_minute"
-  launchctl bootout "gui/$uid/ai.openclaw.learnings-harvest" 2>/dev/null || true
-  launchctl enable "gui/$uid/ai.openclaw.learnings-harvest"
+  launchctl bootout "gui/$uid/$launch_label" 2>/dev/null || true
+  launchctl enable "gui/$uid/$launch_label"
   launchctl bootstrap "gui/$uid" \
-    "$HOME/Library/LaunchAgents/ai.openclaw.learnings-harvest.plist"
+    "$HOME/Library/LaunchAgents/$launch_label.plist"
 else
   python3 "$loop_root/scripts/install_learnings_cron.py" \
     --home "$HOME" --role "$role"

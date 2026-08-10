@@ -24,7 +24,7 @@ def write_jsonl(path: Path, rows):
 
 
 class DailyImprovementLoopTests(unittest.TestCase):
-    def test_claude_pp_cli_detection_requires_bash_tool_use(self):
+    def test_claude_tracked_cli_detection_requires_bash_tool_use(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             write_jsonl(
@@ -36,7 +36,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                         "timestamp": "2026-06-15T00:00:00Z",
                         "message": {
                             "role": "user",
-                            "content": "We discussed stripe-pp-cli but did not run it.",
+                            "content": "We discussed billing-cli but did not run it.",
                         },
                     },
                     {
@@ -50,7 +50,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "type": "tool_use",
                                     "id": "call1",
                                     "name": "Bash",
-                                    "input": {"command": "stripe-pp-cli invoices list --json"},
+                                    "input": {"command": "billing-cli invoices list --json"},
                                 }
                             ],
                         },
@@ -73,7 +73,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                 ],
             )
             summary = loop.parse_claude_session(path)
-            self.assertEqual(sorted(summary.pp_cli_invocations), ["stripe-pp-cli"])
+            self.assertEqual(sorted(summary.tracked_cli_invocations), ["billing-cli"])
             self.assertEqual(len(summary.failures), 1)
             self.assertNotIn("sk-test", summary.failures[0].excerpt)
             self.assertIn("<redacted-", summary.failures[0].excerpt)
@@ -96,7 +96,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                             "type": "function_call",
                             "name": "exec_command",
                             "call_id": "call2",
-                            "arguments": json.dumps({"cmd": "amazon-orders-pp-cli orders list --json"}),
+                            "arguments": json.dumps({"cmd": "orders-cli orders list --json"}),
                         },
                     },
                     {
@@ -111,7 +111,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                 ],
             )
             summary = loop.parse_codex_session(path)
-            self.assertEqual(sorted(summary.pp_cli_invocations), ["amazon-orders-pp-cli"])
+            self.assertEqual(sorted(summary.tracked_cli_invocations), ["orders-cli"])
             self.assertEqual(len(summary.failures), 1)
             self.assertIn("<email>", summary.failures[0].excerpt)
 
@@ -153,10 +153,10 @@ class DailyImprovementLoopTests(unittest.TestCase):
             summary = loop.parse_codex_session(path)
             self.assertEqual(summary.failures, [])
 
-    def test_bulk_pp_cli_failure_is_localized_to_failing_cli(self):
+    def test_bulk_tracked_cli_failure_is_localized_to_failing_cli(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
-            command = "for c in stripe-pp-cli shopify-pp-cli; do echo $c; $c doctor; done"
+            command = "for c in billing-cli commerce-cli; do echo $c; $c doctor; done"
             write_jsonl(
                 path,
                 [
@@ -190,9 +190,9 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     # text is used only to localize which CLI.
                                     "is_error": True,
                                     "content": (
-                                        "stripe-pp-cli\n"
+                                        "billing-cli\n"
                                         "OK Auth: configured\n"
-                                        "shopify-pp-cli\n"
+                                        "commerce-cli\n"
                                         "FAIL Auth: not configured\n"
                                     ),
                                 }
@@ -203,10 +203,10 @@ class DailyImprovementLoopTests(unittest.TestCase):
             )
             summary = loop.parse_claude_session(path)
             proposals = loop.generate_proposals([summary])
-            pp_targets = [p["target"]["name"] for p in proposals if p["route"] == "tool"]
-            self.assertEqual(pp_targets, ["shopify-pp-cli"])
+            tracked_targets = [p["target"]["name"] for p in proposals if p["route"] == "tool"]
+            self.assertEqual(tracked_targets, ["commerce-cli"])
 
-    def test_pp_cli_help_output_is_not_friction(self):
+    def test_tracked_cli_help_output_is_not_friction(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             write_jsonl(
@@ -223,7 +223,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "type": "tool_use",
                                     "id": "call5",
                                     "name": "Bash",
-                                    "input": {"command": "wavespeed-pp-cli run --help"},
+                                    "input": {"command": "media-cli run --help"},
                                 }
                             ],
                         },
@@ -239,7 +239,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "type": "tool_result",
                                     "tool_use_id": "call5",
                                     "content": (
-                                        "Usage: wavespeed-pp-cli run [model-or-alias] [flags]\n"
+                                        "Usage: media-cli run [model-or-alias] [flags]\n"
                                         "      --timeout-ms int   Optional timeout in milliseconds"
                                     ),
                                 }
@@ -279,8 +279,8 @@ class DailyImprovementLoopTests(unittest.TestCase):
 
         self.assertFalse([p for p in proposals if p["route"] == "skill_improvement"])
 
-    def test_text_only_pp_cli_failure_language_is_not_hard_failure(self):
-        # Redacted from the rejected meta-ads/doctor probes in the 20260716
+    def test_text_only_tracked_cli_failure_language_is_not_hard_failure(self):
+        # Regression case based on rejected ads-tool doctor probes.
         # triage batch: diagnostic output is not a failed tool result.
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
@@ -297,7 +297,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "type": "tool_use",
                                     "id": "probe",
                                     "name": "Bash",
-                                    "input": {"command": "meta-ads-pp-cli me --agent"},
+                                    "input": {"command": "ads-cli me --agent"},
                                 }
                             ],
                         },
@@ -326,7 +326,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
 
     def test_completed_codex_inspection_output_is_not_hang_or_failure(self):
         # Redacted composite of fast help/doctor/truncation false positives
-        # from the rejected Klaviyo and RonanRx proposals.
+        # from rejected email and records tool proposals.
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "codex.jsonl"
             write_jsonl(
@@ -340,7 +340,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                             "call_id": "inspect",
                             "input": (
                                 'const r = await tool("exec", {cmd: '
-                                '"klaviyo-pp-cli doctor --json"}); return r;'
+                                '"email-cli doctor --json"}); return r;'
                             ),
                         },
                     },
@@ -360,12 +360,12 @@ class DailyImprovementLoopTests(unittest.TestCase):
             )
 
             summary = loop.parse_codex_session(path)
-            kinds = {ev.kind for ev in summary.pp_cli_invocations["klaviyo-pp-cli"]}
+            kinds = {ev.kind for ev in summary.tracked_cli_invocations["email-cli"]}
 
             self.assertEqual(summary.failures, [])
-            self.assertEqual(kinds, {"pp_cli_invocation"})
+            self.assertEqual(kinds, {"tracked_cli_invocation"})
 
-    def test_pp_cli_mentions_inside_command_arguments_are_not_invocations(self):
+    def test_tracked_cli_mentions_inside_command_arguments_are_not_invocations(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             write_jsonl(
@@ -385,7 +385,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "input": {
                                         "command": (
                                             "bd create --description "
-                                            "'Document wavespeed-pp-cli workflow failure'"
+                                            "'Document media-cli workflow failure'"
                                         )
                                     },
                                 }
@@ -395,21 +395,21 @@ class DailyImprovementLoopTests(unittest.TestCase):
                 ],
             )
             summary = loop.parse_claude_session(path)
-            self.assertEqual(summary.pp_cli_invocations, {})
+            self.assertEqual(summary.tracked_cli_invocations, {})
 
-    def test_pp_cli_inside_heredoc_prompt_is_not_invocation(self):
+    def test_tracked_cli_inside_heredoc_prompt_is_not_invocation(self):
         # Redacted from the Meta Ads false positive: the CLI appeared only in
         # a handoff prompt whose surrounding shell later had a parse error.
         command = (
             "cat > /tmp/task.txt <<'EOF'\n"
-            "Run meta-ads-pp-cli me --agent and report the result.\n"
+            "Run ads-cli me --agent and report the result.\n"
             "EOF\n"
             "printf 'prompt ready\\n'"
         )
 
-        self.assertEqual(loop.pp_cli_names(command), [])
+        self.assertEqual(loop.tracked_cli_names(command), [])
 
-    def test_pp_cli_inside_remote_shell_command_counts(self):
+    def test_tracked_cli_inside_remote_shell_command_counts(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             write_jsonl(
@@ -429,7 +429,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "input": {
                                         "command": (
                                             "source bin/_ssh.sh kssh "
-                                            "'wavespeed-pp-cli profile save bad --model-id x'"
+                                            "'media-cli profile save bad --model-id x'"
                                         )
                                     },
                                 }
@@ -454,7 +454,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                 ],
             )
             summary = loop.parse_claude_session(path)
-            self.assertEqual(sorted(summary.pp_cli_invocations), ["wavespeed-pp-cli"])
+            self.assertEqual(sorted(summary.tracked_cli_invocations), ["media-cli"])
 
     def test_transcript_scaffold_is_not_user_correction(self):
         with tempfile.TemporaryDirectory() as td:
@@ -856,7 +856,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "type": "tool_use",
                                     "id": "callf",
                                     "name": "Bash",
-                                    "input": {"command": "stripe-pp-cli invoices list --json"},
+                                    "input": {"command": "billing-cli invoices list --json"},
                                 }
                             ],
                         },
@@ -888,20 +888,8 @@ class DailyImprovementLoopTests(unittest.TestCase):
             self.assertNotIn("<redacted-", summary.failures[0].excerpt)
 
 
-    def test_printing_press_source_maps_pp_cli_to_library(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "library" / "wavespeed").mkdir(parents=True)
-            self.assertEqual(
-                loop.printing_press_source("wavespeed-pp-cli", root),
-                root / "library" / "wavespeed",
-            )
-            # Not a pp-cli, no root, and unknown name all resolve to None.
-            self.assertIsNone(loop.printing_press_source("ripgrep", root))
-            self.assertIsNone(loop.printing_press_source("wavespeed-pp-cli", None))
-            self.assertIsNone(loop.printing_press_source("nope-pp-cli", root))
 
-    def test_pp_cli_timeout_is_flagged_as_hang(self):
+    def test_tracked_cli_timeout_is_flagged_as_hang(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             write_jsonl(
@@ -918,7 +906,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "type": "tool_use",
                                     "id": "callh",
                                     "name": "Bash",
-                                    "input": {"command": "wavespeed-pp-cli image create --prompt x"},
+                                    "input": {"command": "media-cli image create --prompt x"},
                                 }
                             ],
                         },
@@ -944,11 +932,11 @@ class DailyImprovementLoopTests(unittest.TestCase):
             # A clean timeout is not a hard failure, so it must surface as a hang.
             self.assertFalse(summary.failures)
             proposals = loop.generate_proposals([summary])
-            tool_props = [p for p in proposals if p["target"]["name"] == "wavespeed-pp-cli"]
+            tool_props = [p for p in proposals if p["target"]["name"] == "media-cli"]
             self.assertEqual(len(tool_props), 1)
             self.assertIn("hang/timeout", tool_props[0]["summary"])
 
-    def test_pp_cli_syntax_guessing_is_flagged_without_failure(self):
+    def test_tracked_cli_syntax_guessing_is_flagged_without_failure(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             rows = []
@@ -967,7 +955,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
                                     "id": f"r{i}",
                                     "name": "Bash",
                                     "input": {
-                                        "command": f"wavespeed-pp-cli profile save {flag} a{i}"
+                                        "command": f"media-cli profile save {flag} a{i}"
                                     },
                                 }
                             ],
@@ -978,28 +966,28 @@ class DailyImprovementLoopTests(unittest.TestCase):
             summary = loop.parse_claude_session(path)
             self.assertFalse(summary.failures)
             proposals = loop.generate_proposals([summary])
-            tool_props = [p for p in proposals if p["target"]["name"] == "wavespeed-pp-cli"]
+            tool_props = [p for p in proposals if p["target"]["name"] == "media-cli"]
             self.assertEqual(len(tool_props), 1)
             self.assertIn("retried up to 3x", tool_props[0]["summary"])
 
     def test_repeated_normal_cli_use_is_not_retry_friction(self):
         summary = loop.SessionSummary(source="claude", path=Path("normal.jsonl"), session_id="r2")
-        summary.pp_cli_invocations["ronanrx-pp-cli"] = [
+        summary.tracked_cli_invocations["records-cli"] = [
             loop.Evidence(
                 source="claude",
                 path="normal.jsonl",
                 line=i,
-                kind="pp_cli_invocation",
-                excerpt=f"ronanrx-pp-cli patient find patient-{i}",
+                kind="tracked_cli_invocation",
+                excerpt=f"records-cli record find record-{i}",
                 session_id="r2",
-                command=f"ronanrx-pp-cli patient find patient-{i}",
+                command=f"records-cli record find record-{i}",
             )
             for i in range(27)
         ]
 
         proposals = loop.generate_proposals([summary])
 
-        self.assertFalse([p for p in proposals if p["target"]["name"] == "ronanrx-pp-cli"])
+        self.assertFalse([p for p in proposals if p["target"]["name"] == "records-cli"])
 
     def test_repeated_cli_use_with_same_session_hang_is_retry_friction(self):
         summary = loop.SessionSummary(source="claude", path=Path("hang.jsonl"), session_id="r3")
@@ -1008,10 +996,10 @@ class DailyImprovementLoopTests(unittest.TestCase):
                 source="claude",
                 path="hang.jsonl",
                 line=i,
-                kind="pp_cli_invocation",
-                excerpt="granola-pp-cli folders list --agent",
+                kind="tracked_cli_invocation",
+                excerpt="notes-cli folders list --agent",
                 session_id="r3",
-                command="granola-pp-cli folders list --agent",
+                command="notes-cli folders list --agent",
             )
             for i in range(3)
         ]
@@ -1019,32 +1007,32 @@ class DailyImprovementLoopTests(unittest.TestCase):
             source="claude",
             path="hang.jsonl",
             line=4,
-            kind="pp_cli_hang",
+            kind="tracked_cli_hang",
             excerpt="still running",
             session_id="r3",
-            command="granola-pp-cli folders list --agent",
+            command="notes-cli folders list --agent",
         )
-        summary.pp_cli_invocations["granola-pp-cli"] = invocations + [hang]
+        summary.tracked_cli_invocations["notes-cli"] = invocations + [hang]
 
         proposals = loop.generate_proposals([summary])
-        proposal = next(p for p in proposals if p["target"]["name"] == "granola-pp-cli")
+        proposal = next(p for p in proposals if p["target"]["name"] == "notes-cli")
 
         self.assertIn("hang/timeout", proposal["summary"])
         self.assertIn("retried up to 3x", proposal["summary"])
 
-    def test_distinct_pp_cli_subcommands_are_not_counted_as_retries(self):
+    def test_distinct_tracked_cli_subcommands_are_not_counted_as_retries(self):
         summary = loop.SessionSummary(source="claude", path=Path("x"), session_id="r2")
         commands = [
-            "granola-pp-cli --version",
-            "granola-pp-cli doctor; granola-pp-cli export-all --help",
-            "granola-pp-cli sync --agent; granola-pp-cli stats --agent",
+            "notes-cli --version",
+            "notes-cli doctor; notes-cli export-all --help",
+            "notes-cli sync --agent; notes-cli stats --agent",
         ]
-        summary.pp_cli_invocations["granola-pp-cli"] = [
+        summary.tracked_cli_invocations["notes-cli"] = [
             loop.Evidence(
                 source="claude",
                 path="x",
                 line=index,
-                kind="pp_cli_invocation",
+                kind="tracked_cli_invocation",
                 excerpt=command,
                 session_id="r2",
                 command=command,
@@ -1056,66 +1044,16 @@ class DailyImprovementLoopTests(unittest.TestCase):
 
         self.assertEqual([p for p in proposals if p["route"] == "tool"], [])
 
-    def test_printing_press_source_line_added_to_tool_proposal(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "library" / "wavespeed").mkdir(parents=True)
-            session = Path(td) / "claude.jsonl"
-            write_jsonl(
-                session,
-                [
-                    {
-                        "type": "assistant",
-                        "sessionId": "p1",
-                        "timestamp": "2026-06-15T00:00:00Z",
-                        "message": {
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "tool_use",
-                                    "id": "callp",
-                                    "name": "Bash",
-                                    "input": {"command": "wavespeed-pp-cli profile save --name a"},
-                                }
-                            ],
-                        },
-                    },
-                    {
-                        "type": "user",
-                        "sessionId": "p1",
-                        "timestamp": "2026-06-15T00:00:01Z",
-                        "message": {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": "callp",
-                                    "is_error": True,
-                                    "content": "Error: unknown option --name",
-                                }
-                            ],
-                        },
-                    },
-                ],
-            )
-            summary = loop.parse_claude_session(session)
-            proposals = loop.generate_proposals([summary], root)
-            tool_props = [p for p in proposals if p["target"]["name"] == "wavespeed-pp-cli"]
-            self.assertEqual(len(tool_props), 1)
-            action = tool_props[0]["suggested_action"]
-            self.assertIn(str(root / "library" / "wavespeed"), action)
-            self.assertIn("/printing-press-amend", action)
 
-
-    def test_malformed_pp_cli_names_do_not_become_proposals(self):
+    def test_malformed_tracked_cli_names_do_not_become_proposals(self):
         summary = loop.SessionSummary(source="claude", path=Path("x"), session_id="m1")
-        for bad in ("'wavespeed-pp-cli", "$c-pp-cli", "===x-twitter-pp-cli"):
-            summary.pp_cli_invocations[bad] = [
+        for bad in ("'media-cli", "$c-cli", "===social-cli"):
+            summary.tracked_cli_invocations[bad] = [
                 loop.Evidence(
                     source="claude",
                     path="x",
                     line=1,
-                    kind="pp_cli_hang",
+                    kind="tracked_cli_hang",
                     excerpt="timed out",
                     session_id="m1",
                     command=f"echo {bad}",
@@ -1124,328 +1062,13 @@ class DailyImprovementLoopTests(unittest.TestCase):
         proposals = loop.generate_proposals([summary])
         self.assertEqual([p for p in proposals if p["route"] == "tool"], [])
 
-    def test_unresolved_code_literal_only_cli_candidate_is_dropped(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            summary = loop.SessionSummary(source="codex", path=Path("x"), session_id="code1")
-            command = 'const r = tool({cmd: "fabricated-pp-cli --version"});'
-            summary.tool_calls.append(
-                loop.ToolCall(call_id="x", name="exec", line=1, command=command)
-            )
-            summary.pp_cli_invocations["fabricated-pp-cli"] = [
-                loop.Evidence(
-                    source="codex",
-                    path="x",
-                    line=2,
-                    kind="pp_cli_hang",
-                    excerpt="timed out",
-                    session_id="code1",
-                    command=command,
-                )
-            ]
 
-            original = loop.VALIDATE_PP_CLI_CANDIDATES
-            try:
-                proposals = loop.generate_proposals([summary], root)
-                self.assertEqual([p for p in proposals if p["route"] == "tool"], [])
-
-                loop.VALIDATE_PP_CLI_CANDIDATES = False
-                proposals = loop.generate_proposals([summary], root)
-                self.assertEqual(
-                    [p["target"]["name"] for p in proposals if p["route"] == "tool"],
-                    ["fabricated-pp-cli"],
-                )
-            finally:
-                loop.VALIDATE_PP_CLI_CANDIDATES = original
-
-    def test_repeated_slash_command_stages_content_idea(self):
-        sessions = []
-        for i in range(2):
-            path = Path(f"session-{i}.jsonl")
-            summary = loop.SessionSummary(source="codex", path=path, session_id=f"slash-{i}")
-            ev = loop.Evidence(
-                source="codex",
-                path=str(path),
-                line=10,
-                kind="slash_command",
-                excerpt="/investigate",
-                session_id=f"slash-{i}",
-            )
-            summary.slash_commands.setdefault("investigate", []).append(ev)
-            sessions.append(summary)
-
-        proposals = loop.generate_proposals(sessions, route="content_idea")
-        content_props = [p for p in proposals if p["route"] == "content_idea"]
-
-        self.assertEqual(len(content_props), 1)
-        proposal = content_props[0]
-        self.assertEqual(proposal["content_type"], "how_to")
-        self.assertIn("/investigate", proposal["title"])
-        self.assertEqual(proposal["recommendation"], "write_now")
-        self.assertGreaterEqual(proposal["confidence"], 0.7)
-        self.assertTrue(proposal["last30days"]["should_run"])
-        self.assertIn("suggested_search_query", proposal["last30days"])
-        self.assertIn("rough_outline", proposal)
-        self.assertIn("privacy", proposal)
-        self.assertEqual(proposal["privacy"]["risk_level"], "low")
-        self.assertEqual(proposal["apply_policy"]["mode"], "manual_review_required")
-
-    def test_content_idea_marks_private_contact_workflows_high_risk(self):
-        summary = loop.SessionSummary(source="codex", path=Path("sms.jsonl"), session_id="sms1")
-        ev = loop.Evidence(
-            source="codex",
-            path="sms.jsonl",
-            line=12,
-            kind="tool_failure",
-            excerpt="Built iMessage search database for jane@example.com and Jane Doe at +1 (415) 555-2671",
-            session_id="sms1",
-            command="python scripts/import_imessage.py --contact 'Jane Doe' --phone '+1 (415) 555-2671' --sqlite messages.db",
-        )
-        summary.failures.append(ev)
-
-        proposals = loop.generate_proposals([summary], route="content_idea")
-        content_props = [p for p in proposals if p["route"] == "content_idea"]
-
-        self.assertEqual(len(content_props), 1)
-        proposal = content_props[0]
-        self.assertEqual(proposal["privacy"]["risk_level"], "high")
-        self.assertIn("raw message contents", proposal["privacy"]["must_anonymize"])
-        self.assertIn("personal CRM", proposal["title"])
-        self.assertEqual(proposal["recommendation"], "needs_context")
-        serialized = json.dumps(proposal)
-        self.assertNotIn("Jane Doe", serialized)
-        self.assertNotIn("jane@example.com", serialized)
-        self.assertNotIn("415", serialized)
-        self.assertIn("<private workflow evidence redacted>", serialized)
-
-    def test_route_filter_can_emit_only_content_ideas(self):
-        summary = loop.SessionSummary(source="codex", path=Path("slash.jsonl"), session_id="slash-only")
-        ev = loop.Evidence(
-            source="codex",
-            path="slash.jsonl",
-            line=1,
-            kind="slash_command",
-            excerpt="/gstack",
-            session_id="slash-only",
-        )
-        summary.slash_commands.setdefault("gstack", []).append(ev)
-        proposals = loop.generate_proposals([summary], route="content_idea")
-        self.assertTrue(proposals)
-        self.assertEqual({p["route"] for p in proposals}, {"content_idea"})
-    def test_default_route_preserves_improvement_only_behavior(self):
-        summary = loop.SessionSummary(source="codex", path=Path("slash.jsonl"), session_id="default-route")
-        ev = loop.Evidence(
-            source="codex",
-            path="slash.jsonl",
-            line=1,
-            kind="slash_command",
-            excerpt="/gstack",
-            session_id="default-route",
-        )
-        summary.slash_commands.setdefault("gstack", []).append(ev)
-        proposals = loop.generate_proposals([summary])
-        self.assertEqual([p for p in proposals if p["route"] == "content_idea"], [])
-
-    def test_workflow_command_cluster_stages_content_idea(self):
-        summary = loop.SessionSummary(source="claude", path=Path("task-ledger.jsonl"), session_id="ledger1")
-        summary.tool_calls.extend(
-            [
-                loop.ToolCall(
-                    call_id="a",
-                    name="Bash",
-                    line=10,
-                    command="curl -s -X POST $TASK_LEDGER_API_URL/api/issues/WORK-123/checkout",
-                ),
-                loop.ToolCall(
-                    call_id="b",
-                    name="Bash",
-                    line=11,
-                    command="bash scripts/task-ledger-update.sh --issue-id WORK-123 --status done",
-                ),
-            ]
-        )
-
-        proposals = loop.generate_proposals([summary], route="content_idea")
-        titles = [p["title"] for p in proposals]
-
-        self.assertIn("How I turn agent work into a task ledger instead of chat chaos", titles)
-        proposal = next(p for p in proposals if p["title"] == "How I turn agent work into a task ledger instead of chat chaos")
-        self.assertEqual(proposal["trigger"]["kind"], "workflow_command_cluster")
-        self.assertEqual(proposal["recommendation"], "write_now")
-        self.assertIn("task ledger", proposal["last30days"]["suggested_search_query"])
-
-    def test_private_workflow_command_cluster_suppresses_evidence(self):
-        summary = loop.SessionSummary(source="claude", path=Path("inbox.jsonl"), session_id="ea1")
-        summary.tool_calls.extend(
-            [
-                loop.ToolCall(
-                    call_id="a",
-                    name="Bash",
-                    line=10,
-                    command="gog gmail search 'from:jane@example.com newer_than:24h' --json",
-                ),
-                loop.ToolCall(
-                    call_id="b",
-                    name="Bash",
-                    line=11,
-                    command="gog calendar events primary --from now --to tomorrow --json",
-                ),
-            ]
-        )
-
-        proposals = loop.generate_proposals([summary], route="content_idea")
-        proposal = next(p for p in proposals if "executive assistant" in p["title"])
-        serialized = json.dumps(proposal)
-
-        self.assertEqual(proposal["privacy"]["risk_level"], "high")
-        self.assertEqual(proposal["recommendation"], "needs_context")
-        self.assertNotIn("jane@example.com", serialized)
-        self.assertIn("<private workflow evidence redacted>", serialized)
-
-    def test_content_privacy_notice_and_full_detail_still_suppresses_high_risk_evidence(self):
-        previous_full = loop.FULL_DETAIL
-        loop.FULL_DETAIL = True
-        try:
-            ev = loop.Evidence(
-                source="claude",
-                path="private.jsonl",
-                line=1,
-                kind="workflow_signal",
-                excerpt="gmail thread from jane@example.com about private customer details",
-                session_id="private1",
-                command="gog gmail thread jane@example.com --plain",
-            )
-            proposal = loop.make_content_proposal(
-                title="Private inbox workflow",
-                content_type="how_to",
-                evidence_items=[ev],
-                trigger_kind="private_workflow",
-                real_workflow_or_moment="Inbox workflow with personal details",
-                audience=["operators"],
-                why_interesting=["Useful workflow"],
-                suggested_search_query="AI inbox workflow privacy",
-                rough_outline=["Collect", "Triage", "Anonymize"],
-                confidence=0.8,
-                recommendation="write_now",
-            )
-        finally:
-            loop.FULL_DETAIL = previous_full
-
-        serialized = json.dumps(proposal)
-        self.assertEqual(proposal["recommendation"], "needs_context")
-        self.assertIn("content_notice", proposal["privacy"])
-        self.assertIn("<private workflow evidence redacted>", serialized)
-        self.assertNotIn("jane@example.com", serialized)
-
-    def test_top_skills_content_idea_from_skill_usage(self):
-        summary = loop.SessionSummary(source="claude", path=Path("skills.jsonl"), session_id="skills1")
-        for i, skill in enumerate(["task-ledger", "task-ledger", "x-research", "seo", "task-ledger", "x-research"], 1):
-            summary.skill_invocations.setdefault(skill, []).append(
-                loop.Evidence(
-                    source="claude",
-                    path="skills.jsonl",
-                    line=i,
-                    kind="skill_invocation",
-                    excerpt=f"Skill({skill})",
-                    session_id="skills1",
-                    tool_name="Skill",
-                )
-            )
-
-        proposals = loop.generate_proposals([summary], route="content_idea")
-        proposal = next(p for p in proposals if "top 10 skills" in p["title"].lower())
-
-        self.assertEqual(proposal["trigger"]["kind"], "aggregate_skill_usage")
-        self.assertIn("task-ledger", proposal["summary"])
-        self.assertIn("x-research", proposal["summary"])
-        self.assertEqual(proposal["recommendation"], "write_now")
-
-    def test_most_used_slash_commands_content_idea_from_usage(self):
-        summary = loop.SessionSummary(source="codex", path=Path("slash.jsonl"), session_id="slash-agg")
-        for i, command in enumerate(["gstack", "investigate", "gstack", "last30days"], 1):
-            summary.slash_commands.setdefault(command, []).append(
-                loop.Evidence(
-                    source="codex",
-                    path="slash.jsonl",
-                    line=i,
-                    kind="slash_command",
-                    excerpt=f"/{command}",
-                    session_id="slash-agg",
-                )
-            )
-
-        proposals = loop.generate_proposals([summary], route="content_idea")
-        proposal = next(p for p in proposals if "slash commands" in p["title"].lower())
-
-        self.assertEqual(proposal["trigger"]["kind"], "aggregate_slash_command_usage")
-        self.assertIn("/gstack", proposal["summary"])
-        self.assertIn("/investigate", proposal["summary"])
-        self.assertEqual(proposal["recommendation"], "write_now")
-
-    def test_loop_examples_content_idea_from_multiple_workflow_clusters(self):
-        task_ledger = loop.SessionSummary(source="claude", path=Path("task-ledger.jsonl"), session_id="ledger-loop")
-        task_ledger.tool_calls.extend([
-            loop.ToolCall(call_id="a", name="Bash", line=1, command="curl $TASK_LEDGER_API_URL/api/issues/WORK-123/checkout"),
-            loop.ToolCall(call_id="b", name="Bash", line=2, command="task-ledger-update.sh --issue-id WORK-123 --status done"),
-        ])
-        revenue = loop.SessionSummary(source="claude", path=Path("rev.jsonl"), session_id="rev-loop")
-        revenue.tool_calls.extend([
-            loop.ToolCall(call_id="c", name="Bash", line=1, command="revenue-pp-cli flow-decay --days 90"),
-            loop.ToolCall(call_id="d", name="Bash", line=2, command="revenue-pp-cli metric-aggregates --metric-id abc"),
-            loop.ToolCall(call_id="e", name="Bash", line=3, command="revenue-pp-cli campaign-values-report --since 2026-01-01"),
-        ])
-
-        proposals = loop.generate_proposals([task_ledger, revenue], route="content_idea")
-        proposal = next(p for p in proposals if "loop examples" in p["title"].lower())
-
-        self.assertEqual(proposal["trigger"]["kind"], "aggregate_loop_examples")
-        self.assertIn("task-ledger", proposal["summary"])
-        self.assertIn("revenue-watch", proposal["summary"])
-        self.assertEqual(proposal["recommendation"], "write_now")
-
-    def test_most_used_cli_commands_content_idea_from_tool_calls(self):
-        summary = loop.SessionSummary(source="claude", path=Path("commands.jsonl"), session_id="cmd1")
-        summary.tool_calls.extend([
-            loop.ToolCall(call_id="a", name="Bash", line=1, command="revenue-pp-cli flow-decay --days 90"),
-            loop.ToolCall(call_id="b", name="Bash", line=2, command="revenue-pp-cli metric-aggregates --metric-id abc"),
-            loop.ToolCall(call_id="c", name="Bash", line=3, command="gog gmail search 'in:inbox' --json"),
-            loop.ToolCall(call_id="d", name="Bash", line=4, command="gh pr view 1 --json url"),
-            loop.ToolCall(call_id="e", name="Bash", line=5, command="# comment only"),
-            loop.ToolCall(call_id="f", name="Bash", line=6, command="<<'MD' heredoc content"),
-        ])
-
-        proposals = loop.generate_proposals([summary], route="content_idea")
-        proposal = next(p for p in proposals if "command-line stack" in p["title"].lower())
-
-        self.assertEqual(proposal["trigger"]["kind"], "aggregate_cli_usage")
-        self.assertIn("revenue-pp-cli", proposal["summary"])
-        self.assertIn("gog", proposal["summary"])
-        self.assertIn("gh", proposal["summary"])
-        self.assertNotIn("<<'MD'", proposal["summary"])
-        self.assertNotIn("#", proposal["summary"])
-
-    def test_absolute_paths_are_not_slash_commands(self):
-        summary = loop.SessionSummary(source="codex", path=Path("paths.jsonl"), session_id="paths")
-        ev = loop.Evidence(
-            source="codex",
-            path="paths.jsonl",
-            line=1,
-            kind="slash_command",
-            excerpt="/Users",
-            session_id="paths",
-        )
-        # Regression guard for parser-level behavior discovered in real data:
-        # slash-command regex should not classify absolute macOS paths as commands.
-        self.assertEqual(loop.SLASH_COMMAND_RE.findall("/Users/knox/project\n/gstack"), ["gstack"])
-        summary.slash_commands.setdefault("Users", []).append(ev)
-        proposals = loop.generate_proposals([summary], route="content_idea")
-        self.assertEqual([p for p in proposals if "/Users" in p.get("title", "")], [])
 
     def test_discover_session_files_combines_multiple_homes(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            home_a = root / "knox"
-            home_b = root / "mac-studio"
+            home_a = root / "laptop"
+            home_b = root / "desktop"
             codex_a = home_a / ".codex" / "sessions" / "a.jsonl"
             codex_b = home_b / ".codex" / "sessions" / "b.jsonl"
             write_jsonl(codex_a, [])
@@ -1478,7 +1101,7 @@ class CurrentTranscriptFormatTests(unittest.TestCase):
                             "call_id": "cc1",
                             "input": (
                                 'const r = await tool("bash", '
-                                '{command: "stripe-pp-cli invoices list --json"}); return r;'
+                                '{command: "billing-cli invoices list --json"}); return r;'
                             ),
                         },
                     },
@@ -1494,10 +1117,10 @@ class CurrentTranscriptFormatTests(unittest.TestCase):
                 ],
             )
             summary = loop.parse_codex_session(path)
-            self.assertEqual(sorted(summary.pp_cli_invocations), ["stripe-pp-cli"])
+            self.assertEqual(sorted(summary.tracked_cli_invocations), ["billing-cli"])
             self.assertEqual(len(summary.failures), 1)
             self.assertEqual(summary.failures[0].occurred_at, "2026-07-15T00:00:02+00:00")
-            kinds = {ev.kind for ev in summary.pp_cli_invocations["stripe-pp-cli"]}
+            kinds = {ev.kind for ev in summary.tracked_cli_invocations["billing-cli"]}
             self.assertIn("tool_failure", kinds)
             proposal = next(
                 p for p in loop.generate_proposals([summary]) if p["route"] == "tool"
@@ -1505,22 +1128,22 @@ class CurrentTranscriptFormatTests(unittest.TestCase):
             self.assertEqual(proposal["latest_evidence_at"], "2026-07-15T00:00:02+00:00")
 
     def test_code_literal_escaped_newline_does_not_fabricate_cli_name(self):
-        # Redacted from the exact `|| true\ncloudflare-pp-cli` shape that
-        # produced the rejected truencloudflare-pp-cli proposal.
+        # Redacted from the exact `|| true\nedge-cli` shape that
+        # produced the rejected malformed-edge-cli proposal.
         code = (
             'const r = await tool("exec", {"cmd": '
-            '"rg missing || true\\ncloudflare-pp-cli --version"}); return r;'
+            '"rg missing || true\\nedge-cli --version"}); return r;'
         )
 
-        self.assertEqual(loop.pp_cli_names_from_code(code), ["cloudflare-pp-cli"])
+        self.assertEqual(loop.tracked_cli_names_from_code(code), ["edge-cli"])
 
     def test_code_literal_patch_text_is_not_cli_invocation(self):
         code = (
             'const patch = "*** Begin Patch\\n'
-            '+Run ronanrx-pp-cli doctor --agent\\n*** End Patch";'
+            '+Run records-cli doctor --agent\\n*** End Patch";'
         )
 
-        self.assertEqual(loop.pp_cli_names_from_code(code), [])
+        self.assertEqual(loop.tracked_cli_names_from_code(code), [])
 
     def test_codex_custom_tool_call_prose_literal_is_not_invocation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1536,7 +1159,7 @@ class CurrentTranscriptFormatTests(unittest.TestCase):
                             "name": "exec",
                             "call_id": "cc2",
                             "input": (
-                                'const msg = "Document wavespeed-pp-cli workflow failure"; '
+                                'const msg = "Document media-cli workflow failure"; '
                                 'await tool("bd", {description: msg});'
                             ),
                         },
@@ -1544,7 +1167,7 @@ class CurrentTranscriptFormatTests(unittest.TestCase):
                 ],
             )
             summary = loop.parse_codex_session(path)
-            self.assertEqual(summary.pp_cli_invocations, {})
+            self.assertEqual(summary.tracked_cli_invocations, {})
 
     def test_claude_is_error_flag_is_trusted_over_text_heuristics(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1701,7 +1324,7 @@ class ProposalNoiseTests(unittest.TestCase):
                                     "type": "tool_use",
                                     "id": "tw",
                                     "name": "Bash",
-                                    "input": {"command": "timeout 120 wavespeed-pp-cli run --json"},
+                                    "input": {"command": "timeout 120 media-cli run --json"},
                                 }
                             ],
                         },
@@ -1743,7 +1366,7 @@ class ProposalNoiseTests(unittest.TestCase):
                                     "type": "tool_use",
                                     "id": "fetch",
                                     "name": "Bash",
-                                    "input": {"command": "orders-pp-cli orders list --json"},
+                                    "input": {"command": "orders-cli orders list --json"},
                                 }
                             ],
                         },
@@ -1776,7 +1399,7 @@ class ProposalNoiseTests(unittest.TestCase):
 
             self.assertEqual(len(summary.silent_empty), 1)
             self.assertEqual(summary.silent_empty[0].kind, "silent_empty")
-            tool = [p for p in proposals if p["target"]["name"] == "orders-pp-cli"]
+            tool = [p for p in proposals if p["target"]["name"] == "orders-cli"]
             self.assertEqual(len(tool), 1)
             self.assertIn("1 swallowed empty result(s)", tool[0]["summary"])
 
@@ -1864,7 +1487,7 @@ class ProposalNoiseTests(unittest.TestCase):
 
     def test_final_empty_result_is_not_silent_empty(self):
         summary = self._parse_claude_empty_result(
-            "orders-pp-cli orders list --json",
+            "orders-cli orders list --json",
             output="{}",
             continue_after=False,
             path_name="final-empty.jsonl",
@@ -1910,11 +1533,11 @@ class ProposalNoiseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "subagents" / "agent-1.jsonl"
             summary = self._parse_claude_empty_result(
-                "orders-pp-cli orders list --json", output="{}", path=path
+                "orders-cli orders list --json", output="{}", path=path
             )
             self.assertEqual(len(summary.silent_empty), 1)
             proposals = loop.generate_proposals([summary])
-            self.assertFalse([p for p in proposals if p["target"]["name"] == "orders-pp-cli"])
+            self.assertFalse([p for p in proposals if p["target"]["name"] == "orders-cli"])
 
     def _parse_claude_empty_result(
         self,
@@ -2054,17 +1677,27 @@ class RedactionCorpusTests(unittest.TestCase):
 
 
 class ConfigAndHealthTests(unittest.TestCase):
+    def test_cli_surface_stays_focused_on_improvement_sources(self):
+        parser = loop.build_parser()
+        actions = {action.dest: action for action in parser._actions}
+
+        self.assertEqual(
+            list(actions["source"].choices),
+            ["all", "claude", "codex", "hermes_profile_log"],
+        )
+        self.assertNotIn("route", actions)
+        self.assertEqual(loop.TRACKED_CLI_SUFFIX, "-cli")
+
     def _snapshot_globals(self):
         return (
             loop.TRACKED_CLI_SUFFIX,
-            loop.PP_CLI_RE,
-            loop.VALID_PP_CLI_RE,
+            loop.TRACKED_CLI_RE,
+            loop.VALID_TRACKED_CLI_RE,
             list(loop.EXTRA_SCAFFOLD_MARKERS),
             list(loop.SECRET_PATTERNS),
             set(loop.BACKLOG_IGNORE_EXECUTABLES),
             set(loop.REMOTE_COMMAND_WRAPPERS),
             loop.INCLUDE_SUBAGENT_FAILURES,
-            loop.VALIDATE_PP_CLI_CANDIDATES,
             loop.DETECT_SILENT_EMPTY,
             set(loop.SILENT_EMPTY_FETCH_VERBS),
             set(loop.SILENT_EMPTY_IGNORE_EXECUTABLES),
@@ -2073,14 +1706,13 @@ class ConfigAndHealthTests(unittest.TestCase):
     def _restore_globals(self, snap):
         (
             loop.TRACKED_CLI_SUFFIX,
-            loop.PP_CLI_RE,
-            loop.VALID_PP_CLI_RE,
+            loop.TRACKED_CLI_RE,
+            loop.VALID_TRACKED_CLI_RE,
             markers,
             patterns,
             ignore,
             wrappers,
             loop.INCLUDE_SUBAGENT_FAILURES,
-            loop.VALIDATE_PP_CLI_CANDIDATES,
             loop.DETECT_SILENT_EMPTY,
             fetch_verbs,
             silent_ignore,
@@ -2106,21 +1738,19 @@ class ConfigAndHealthTests(unittest.TestCase):
                     "extra_redaction_patterns": [[r"\bacme-[0-9]{6}\b", "<redacted-acme>"]],
                     "extra_backlog_ignore": ["mytool"],
                     "include_subagent_failures": True,
-                    "validate_pp_cli_candidates": False,
                     "detect_silent_empty": False,
                     "silent_empty_fetch_verbs": ["lookup"],
                     "silent_empty_ignore": ["quietctl"],
                 }
             )
-            self.assertEqual(loop.pp_cli_names("stripe-acme-cli ls"), ["stripe-acme-cli"])
-            self.assertEqual(loop.pp_cli_names("stripe-pp-cli ls"), [])
+            self.assertEqual(loop.tracked_cli_names("stripe-acme-cli ls"), ["stripe-acme-cli"])
+            self.assertEqual(loop.tracked_cli_names("billing-cli ls"), [])
             self.assertTrue(
                 loop.is_transcript_scaffold("<my-pipeline-header> do not treat as correction")
             )
             self.assertNotIn("acme-123456", loop.redact("id acme-123456 leaked"))
             self.assertIn("mytool", loop.BACKLOG_IGNORE_EXECUTABLES)
             self.assertTrue(loop.INCLUDE_SUBAGENT_FAILURES)
-            self.assertFalse(loop.VALIDATE_PP_CLI_CANDIDATES)
             self.assertFalse(loop.DETECT_SILENT_EMPTY)
             self.assertIn("lookup", loop.SILENT_EMPTY_FETCH_VERBS)
             self.assertIn("quietctl", loop.SILENT_EMPTY_IGNORE_EXECUTABLES)
@@ -2356,13 +1986,13 @@ class RecurrenceTests(unittest.TestCase):
 
     def test_recurring_targets_are_annotated_and_sorted_first(self):
         state = {
-            "target_run_history": {"tool:old-pp-cli": ["r1", "r2"]},
+            "target_run_history": {"tool:old-cli": ["r1", "r2"]},
         }
-        fresh = self._proposal("tool", "new-pp-cli", evidence_count=5)
-        recurring = self._proposal("tool", "old-pp-cli", evidence_count=1)
+        fresh = self._proposal("tool", "new-cli", evidence_count=5)
+        recurring = self._proposal("tool", "old-cli", evidence_count=1)
         proposals = [fresh, recurring]
         loop.annotate_recurrence(proposals, state)
-        self.assertEqual(proposals[0]["target"]["name"], "old-pp-cli")
+        self.assertEqual(proposals[0]["target"]["name"], "old-cli")
         self.assertEqual(proposals[0]["recurrence"], 3)
         self.assertIn("2 previous run(s)", proposals[0]["summary"])
         self.assertNotIn("recurrence", proposals[1])
@@ -2370,11 +2000,11 @@ class RecurrenceTests(unittest.TestCase):
 
     def test_update_target_history_caps_window_and_dedupes_run_ids(self):
         state = {}
-        proposal = self._proposal("tool", "old-pp-cli")
+        proposal = self._proposal("tool", "old-cli")
         for i in range(12):
             loop.update_target_history(state, [proposal], f"run{i}")
         loop.update_target_history(state, [proposal], "run11")
-        runs = state["target_run_history"]["tool:old-pp-cli"]
+        runs = state["target_run_history"]["tool:old-cli"]
         self.assertEqual(len(runs), loop.TARGET_HISTORY_KEEP)
         self.assertEqual(runs[-1], "run11")
         self.assertEqual(runs[0], "run2")
@@ -2415,18 +2045,18 @@ class ResolutionTests(unittest.TestCase):
         )
 
     def test_fixed_resolution_suppresses_old_evidence_and_reopens_regression(self):
-        old = self._proposal("cloudflare-pp-cli", "2026-07-15T11:59:59Z", line=1)
-        new = self._proposal("cloudflare-pp-cli", "2026-07-15T12:00:01Z", line=2)
+        old = self._proposal("edge-cli", "2026-07-15T11:59:59Z", line=1)
+        new = self._proposal("edge-cli", "2026-07-15T12:00:01Z", line=2)
         result = loop.filter_new_proposals(
             [old, new],
             {},
             include_seen=False,
-            resolutions={"tool:cloudflare-pp-cli": self._resolution("fixed")},
+            resolutions={"tool:edge-cli": self._resolution("fixed")},
         )
 
         self.assertEqual(result.proposals, [new])
         self.assertEqual(len(result.suppressed), 1)
-        self.assertEqual(result.suppressed[0]["target"], "tool:cloudflare-pp-cli")
+        self.assertEqual(result.suppressed[0]["target"], "tool:edge-cli")
         self.assertEqual(result.regressions, [new])
         self.assertIn("Regression after 71 (fixed 2026-07-15T12:00:00+00:00)", new["summary"])
         self.assertEqual(old["latest_evidence_at"], "2026-07-15T11:59:59+00:00")
@@ -2459,11 +2089,11 @@ class ResolutionTests(unittest.TestCase):
         )
 
     def test_wontfix_and_ignored_always_suppress_and_include_resolved_bypasses(self):
-        wontfix = self._proposal("shopify-pp-cli", "2026-07-16T00:00:00Z", line=1)
-        ignored = self._proposal("truencloudflare-pp-cli", "2026-07-16T00:00:00Z", line=2)
+        wontfix = self._proposal("commerce-cli", "2026-07-16T00:00:00Z", line=1)
+        ignored = self._proposal("malformed-edge-cli", "2026-07-16T00:00:00Z", line=2)
         resolutions = {
-            "tool:shopify-pp-cli": self._resolution("wontfix"),
-            "tool:truencloudflare-pp-cli": self._resolution("ignored"),
+            "tool:commerce-cli": self._resolution("wontfix"),
+            "tool:malformed-edge-cli": self._resolution("ignored"),
         }
 
         normal = loop.filter_new_proposals(
@@ -2483,21 +2113,21 @@ class ResolutionTests(unittest.TestCase):
         self.assertTrue(all(p["included_resolved"] for p in debug.proposals))
 
     def test_include_seen_does_not_bypass_resolution(self):
-        proposal = self._proposal("linq-pp-cli", "2026-07-14T00:00:00Z")
+        proposal = self._proposal("linq-cli", "2026-07-14T00:00:00Z")
         result = loop.filter_new_proposals(
             [proposal],
             {"seen_proposal_keys": [proposal["proposal_key"]]},
             include_seen=True,
-            resolutions={"tool:linq-pp-cli": self._resolution("fixed")},
+            resolutions={"tool:linq-cli": self._resolution("fixed")},
         )
         self.assertEqual(result.proposals, [])
         self.assertEqual(len(result.suppressed), 1)
 
     def test_recurrence_counts_only_runs_after_resolution(self):
-        proposal = self._proposal("cloud-run-admin-pp-cli", "2026-07-17T00:00:00Z")
+        proposal = self._proposal("cloud-run-admin-cli", "2026-07-17T00:00:00Z")
         state = {
             "target_run_history": {
-                "tool:cloud-run-admin-pp-cli": [
+                "tool:cloud-run-admin-cli": [
                     "20260714T120000Z",
                     "20260715T120000Z",
                     "20260716T120000Z",
@@ -2505,7 +2135,7 @@ class ResolutionTests(unittest.TestCase):
             }
         }
         resolutions = {
-            "tool:cloud-run-admin-pp-cli": self._resolution(
+            "tool:cloud-run-admin-cli": self._resolution(
                 "fixed", resolved_at="2026-07-15T12:00:00Z", pr="62"
             )
         }
@@ -2526,7 +2156,7 @@ class ResolutionTests(unittest.TestCase):
                             "--output-root",
                             str(root),
                             "--resolve",
-                            "tool:cloudflare-pp-cli",
+                            "tool:edge-cli",
                             "--decision",
                             "fixed",
                             "--resolved-at",
@@ -2549,7 +2179,7 @@ class ResolutionTests(unittest.TestCase):
                     "decisions": [
                         {
                             "proposal_id": "imp-example",
-                            "target": "tool:shopify-pp-cli",
+                            "target": "tool:commerce-cli",
                             "decision": "ignored",
                             "resolved_at": "2026-07-16T00:00:00Z",
                             "pr": "",
@@ -2579,9 +2209,9 @@ class ResolutionTests(unittest.TestCase):
                     loop.main(["--output-root", str(root), "--list-resolutions"]), 0
                 )
             listed = json.loads(output.getvalue())
-            self.assertEqual(listed["tool:cloudflare-pp-cli"]["pr"], "71")
-            self.assertEqual(listed["tool:shopify-pp-cli"]["decision"], "ignored")
-            self.assertEqual(listed["tool:shopify-pp-cli"]["by"], "reviewer")
+            self.assertEqual(listed["tool:edge-cli"]["pr"], "71")
+            self.assertEqual(listed["tool:commerce-cli"]["decision"], "ignored")
+            self.assertEqual(listed["tool:commerce-cli"]["by"], "reviewer")
 
             with redirect_stdout(output):
                 self.assertEqual(
@@ -2590,12 +2220,12 @@ class ResolutionTests(unittest.TestCase):
                             "--output-root",
                             str(root),
                             "--unresolve",
-                            "tool:cloudflare-pp-cli",
+                            "tool:edge-cli",
                         ]
                     ),
                     0,
                 )
-            self.assertNotIn("tool:cloudflare-pp-cli", loop.load_resolutions(root))
+            self.assertNotIn("tool:edge-cli", loop.load_resolutions(root))
 
     def test_resolve_defaults_watermark_to_now(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2608,7 +2238,7 @@ class ResolutionTests(unittest.TestCase):
                             "--output-root",
                             str(root),
                             "--resolve",
-                            "tool:linq-pp-cli",
+                            "tool:linq-cli",
                             "--decision",
                             "fixed",
                         ]
@@ -2617,7 +2247,7 @@ class ResolutionTests(unittest.TestCase):
                 )
             after = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
             recorded = loop.parse_time(
-                loop.load_resolutions(root)["tool:linq-pp-cli"]["resolved_at"]
+                loop.load_resolutions(root)["tool:linq-cli"]["resolved_at"]
             )
             self.assertIsNotNone(recorded)
             self.assertGreaterEqual(recorded, before)
@@ -2630,30 +2260,30 @@ class ResolutionTests(unittest.TestCase):
             (root / "state.json").write_text("{broken", encoding="utf-8")
             loop.update_resolutions(
                 root,
-                {"tool:linq-pp-cli": self._resolution("fixed", pr="68")},
+                {"tool:linq-cli": self._resolution("fixed", pr="68")},
             )
             self.assertEqual(loop.load_state(root)["seen_proposal_keys"], [])
-            self.assertEqual(loop.load_resolutions(root)["tool:linq-pp-cli"]["pr"], "68")
+            self.assertEqual(loop.load_resolutions(root)["tool:linq-cli"]["pr"], "68")
 
             loop.write_json(root / "state.json", {})
             loop.update_resolutions(
                 root,
-                {"tool:shopify-pp-cli": self._resolution("ignored", pr="")},
+                {"tool:commerce-cli": self._resolution("ignored", pr="")},
             )
             self.assertEqual(set(loop.load_resolutions(root)), {
-                "tool:linq-pp-cli",
-                "tool:shopify-pp-cli",
+                "tool:linq-cli",
+                "tool:commerce-cli",
             })
 
     def test_review_packet_reports_suppression_and_regressions(self):
-        old = self._proposal("cloudflare-pp-cli", "2026-07-15T00:00:00Z", line=1)
-        proposal = self._proposal("cloudflare-pp-cli", "2026-07-16T00:00:00Z", line=2)
+        old = self._proposal("edge-cli", "2026-07-15T00:00:00Z", line=1)
+        proposal = self._proposal("edge-cli", "2026-07-16T00:00:00Z", line=2)
         resolution = self._resolution("fixed")
         filtered = loop.filter_new_proposals(
             [old, proposal],
             {},
             include_seen=False,
-            resolutions={"tool:cloudflare-pp-cli": resolution},
+            resolutions={"tool:edge-cli": resolution},
         )
         with tempfile.TemporaryDirectory() as td:
             packet = loop.write_review_packet(
@@ -2668,7 +2298,7 @@ class ResolutionTests(unittest.TestCase):
         self.assertIn("1 proposals suppressed as already-resolved", packet)
         self.assertIn("Regressions re-opened after a fix: 1", packet)
         self.assertIn("## Regressions re-opened after a fix", packet)
-        self.assertIn("tool:cloudflare-pp-cli", packet)
+        self.assertIn("tool:edge-cli", packet)
 
     def test_hermes_parser_ignores_persona_scaffold_and_attributes_machine(self):
         rows = [
@@ -2687,7 +2317,7 @@ class ResolutionTests(unittest.TestCase):
                             "function": {
                                 "name": "terminal",
                                 "arguments": json.dumps(
-                                    {"command": "shopify-pp-cli products list"}
+                                    {"command": "commerce-cli products list"}
                                 ),
                             },
                         }
@@ -2708,11 +2338,11 @@ class ResolutionTests(unittest.TestCase):
         loop.stamp_session_machine(summary, "desktop")
         self.assertEqual(len(summary.corrections), 1)
         self.assertEqual(summary.corrections[0].machine, "desktop")
-        self.assertEqual(sorted(summary.pp_cli_invocations), ["shopify-pp-cli"])
+        self.assertEqual(sorted(summary.tracked_cli_invocations), ["commerce-cli"])
         proposal = next(
             item
             for item in loop.generate_proposals([summary])
-            if item["target"]["name"] == "shopify-pp-cli"
+            if item["target"]["name"] == "commerce-cli"
         )
         self.assertEqual(proposal["machines"], ["desktop"])
         self.assertTrue(all(item["machine"] == "desktop" for item in proposal["evidence"]))
@@ -2744,7 +2374,7 @@ class ResolutionTests(unittest.TestCase):
                     line=4,
                     kind="tool_failure",
                     excerpt="Error: unknown flag",
-                    command="demo-pp-cli list --bad",
+                    command="demo-cli list --bad",
                     machine=machine,
                 )
                 proposal = loop.make_proposal(
@@ -2752,7 +2382,7 @@ class ResolutionTests(unittest.TestCase):
                     title="Review demo CLI",
                     summary="One failure",
                     target_kind="tool",
-                    target_name="demo-pp-cli",
+                    target_name="demo-cli",
                     evidence_items=[ev],
                     suggested_action="Review",
                     impact=["Retry"],
@@ -2798,12 +2428,12 @@ class ResolutionTests(unittest.TestCase):
     def test_fleet_boundary_recursively_redacts_tool_output_secrets(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            leaked = "pcp_" + "a" * 48
+            leaked = "ghp_" + "a" * 48
             proposal = {
                 "proposal_id": "imp-secret",
                 "evidence": [
                     {
-                        "command": "paperclip issue get --api-key <redacted-secret>",
+                        "command": "demo-cli status --api-key <redacted-secret>",
                         "excerpt": json.dumps(
                             {"output": f'argv: ["--api-key", "{leaked}"]'}
                         ),
@@ -2822,7 +2452,7 @@ class ResolutionTests(unittest.TestCase):
             self.assertIsNotNone(path)
             serialized = path.read_text(encoding="utf-8")
             self.assertNotIn(leaked, serialized)
-            self.assertIn("<redacted-paperclip-key>", serialized)
+            self.assertIn("<redacted-github-token>", serialized)
 
     def test_fleet_snapshot_keeps_seen_unresolved_proposals(self):
         ev = loop.Evidence(
@@ -2838,7 +2468,7 @@ class ResolutionTests(unittest.TestCase):
             title="Review demo CLI",
             summary="One failure",
             target_kind="tool",
-            target_name="demo-pp-cli",
+            target_name="demo-cli",
             evidence_items=[ev],
             suggested_action="Review",
             impact=["Retry"],
@@ -2855,13 +2485,13 @@ class ResolutionTests(unittest.TestCase):
     def test_fleet_collector_resanitizes_a_peer_bundle(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "queue"
-            leaked = "pcp_" + "b" * 48
+            leaked = "ghp_" + "b" * 48
             proposal = loop.make_proposal(
                 route="tool",
                 title="Review demo CLI",
                 summary="One failure",
                 target_kind="tool",
-                target_name="demo-pp-cli",
+                target_name="demo-cli",
                 evidence_items=[
                     loop.Evidence(
                         source="hermes_profile_log",
@@ -2905,7 +2535,7 @@ class ResolutionTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertNotIn(leaked, packet)
-            self.assertIn("<redacted-paperclip-key>", packet)
+            self.assertIn("<redacted-github-token>", packet)
 
 
 if __name__ == "__main__":

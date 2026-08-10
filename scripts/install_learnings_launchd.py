@@ -11,6 +11,7 @@ from typing import Any
 
 
 PATH_VALUE = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+LABEL_PREFIX = "io.agent-improvement-loop"
 
 
 def launch_agent(
@@ -44,8 +45,8 @@ def build_plists(
 ) -> dict[str, dict[str, Any]]:
     templates = loop_root / "templates"
     result = {
-        "ai.openclaw.learnings-harvest": launch_agent(
-            label="ai.openclaw.learnings-harvest",
+        f"{LABEL_PREFIX}.learnings-harvest": launch_agent(
+            label=f"{LABEL_PREFIX}.learnings-harvest",
             script=templates / "learnings-harvest-run.sh",
             schedule={"Weekday": 0, "Hour": 18, "Minute": harvest_minute},
             home=home,
@@ -54,21 +55,21 @@ def build_plists(
     if role == "leader":
         result.update(
             {
-                "ai.openclaw.learnings-collect": launch_agent(
-                    label="ai.openclaw.learnings-collect",
+                f"{LABEL_PREFIX}.learnings-collect": launch_agent(
+                    label=f"{LABEL_PREFIX}.learnings-collect",
                     script=loop_root / "scripts/collect_learnings_fleet.sh",
                     schedule={"Hour": 7, "Minute": 10},
                     home=home,
                     environment={"AGENT_LEARNINGS_REMOTE_HOSTS": remote_hosts},
                 ),
-                "ai.openclaw.learnings-fixloop": launch_agent(
-                    label="ai.openclaw.learnings-fixloop",
+                f"{LABEL_PREFIX}.learnings-fixloop": launch_agent(
+                    label=f"{LABEL_PREFIX}.learnings-fixloop",
                     script=templates / "learnings-fixloop-run.sh",
                     schedule={"Hour": 7, "Minute": 30},
                     home=home,
                 ),
-                "ai.openclaw.learnings-review": launch_agent(
-                    label="ai.openclaw.learnings-review",
+                f"{LABEL_PREFIX}.learnings-review": launch_agent(
+                    label=f"{LABEL_PREFIX}.learnings-review",
                     script=templates / "learnings-review-run.sh",
                     schedule={"Day": 1, "Hour": 9, "Minute": 7},
                     home=home,

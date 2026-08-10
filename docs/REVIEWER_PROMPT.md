@@ -62,7 +62,7 @@ Use this schema:
   "decisions": [
     {
       "proposal_id": "imp-example",
-      "target": "tool:example-pp-cli",
+      "target": "tool:example-cli",
       "decision": "fixed",
       "resolved_at": "<ISO8601 UTC; omit to use import time>",
       "pr": "<PR number or URL, or empty>",
