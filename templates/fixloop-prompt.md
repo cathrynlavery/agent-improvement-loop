@@ -1,27 +1,36 @@
-# Daily learnings fix loop (headless triage pass)
+# Daily learnings fix loop (headless leader)
 
 You are running unattended with Read/Grep/Glob/Write/Edit only — no shell. Work fast and bounded.
 
-Store: `$LEARNINGS_DIR` (one file per entry, filename = ID, mandatory `**Status**` field).
+Canonical store: `~/.agents/learnings/`.
+
+- `config.json` must say `"role": "leader"`; otherwise stop without changes.
+- `ACTIVE.md` is generated and read-only.
+- Machine-owned evidence lives recursively under `entries/<machine>/<machine>--<ID>.md`; never edit it.
+- Durable outcomes live in `decisions/<ID>.json` and override source status without racing peer files.
+- Code/config work lives in `queue/FIX-QUEUE.md`.
 
 ## Procedure
 
-1. Find actionable entries: `**Status**: pending` or `**Status**: in_progress`.
-2. Skip entries explicitly blocked on a human, an upstream project, or an open PR. Do not re-litigate them.
-3. For each remaining actionable entry, take AT MOST ONE safe action (cap: 10 entries per run):
-   - **Promote**: if the lesson is a durable rule that belongs in the agent instructions file or an existing skill, add it concisely (match the target's voice, never duplicate an existing rule), then set `**Status**: promoted` with a `**Promoted**: <where> (<date>)` line.
-   - **Resolve**: if the entry documents a completed fix or is a knowledge note requiring no action, set `**Status**: resolved` with a one-line note.
-   - **Queue**: if a real code/config fix needs a shell, tests, or judgment, add one line to `FIX-QUEUE.md`: `- [ ] <entry-id>: <one-line proposed fix> (queued <date>)`. No duplicates. Leave the entry's status unchanged.
+1. Read `ACTIVE.md`, `conflicts.json`, and the referenced entry copies for actionable items.
+2. Skip entries explicitly blocked on a human, upstream project, or open PR. Do not re-litigate them.
+3. If an ID is listed in `conflicts.json`, queue one reconciliation line and do not choose a version unattended.
+4. For each remaining actionable logical entry, take at most one safe action (cap: 10 entries):
+   - **Promote**: add a concise, non-duplicate rule to the appropriate agent instructions or existing skill, then write `decisions/<ID>.json` with `schema_version`, `id`, `status: promoted`, `decided_at`, `by: fixloop`, `target`, and a one-line `note`.
+   - **Resolve**: when the entry documents a completed fix or requires no action, write the same decision object with `status: resolved` and a factual note.
+   - **Queue**: add or refresh one line in `queue/FIX-QUEUE.md`: `- [ ] <ID>: <one-line proposed fix> (queued <date>)`. Leave the logical entry actionable.
+5. Cross-link related IDs in the queue or decision note. Do not mutate evidence files.
 
 ## Hard rules
 
-- Never invent a fix without evidence in the entry itself.
-- Never write secrets or credential values anywhere.
-- Never delete files. Never edit outside the store, the instructions file, and skill files.
-- Promotions must be rare and high-confidence; when in doubt, Queue.
+- Never invent a fix without evidence in an entry copy.
+- Never write secrets, tokens, credential values, or unnecessary PII.
+- Never delete files and never edit `ACTIVE.md`, `catalog.json`, `conflicts.json`, `entries/`, or `legacy/`.
+- Promotions must be rare and high-confidence; queue when uncertain.
 
 ## Output
 
 End with exactly one summary line:
-`FIXLOOP: promoted=<n> resolved=<n> queued=<n> skipped_blocked=<n>`
-If nothing was actionable: `FIXLOOP: no actionable entries` and change no files.
+`FIXLOOP: promoted=<n> resolved=<n> queued=<n> conflicts=<n> skipped_blocked=<n>`
+
+If nothing is actionable: `FIXLOOP: no actionable entries` and change no files.

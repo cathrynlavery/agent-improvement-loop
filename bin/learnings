@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+loop_root="${AGENT_IMPROVEMENT_ROOT:-$HOME/.local/share/agent-improvement-loop}"
+exec "$loop_root/bin/learnings-store" "$@"

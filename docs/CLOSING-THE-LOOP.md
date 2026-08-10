@@ -12,7 +12,7 @@ The miner in this repo is the *capture* half of a self-improvement system: it re
 
 | Stage | Cadence | Actor | What it does |
 |---|---|---|---|
-| **Capture** | continuous | every agent session | log errors/corrections to the store, one file per entry, filename = ID, mandatory `**Status**` field |
+| **Capture** | continuous | every agent session | log errors/corrections locally, one machine-prefixed file per entry, mandatory `**Status**` field |
 | **Harvest** | weekly | headless scheduled run | mine transcripts for learnings that in-session logging missed (this repo's miner) |
 | **Fixloop** | daily | headless scheduled run, **no shell access** | triage new entries: promote safe rules, resolve knowledge notes, queue real work into `FIX-QUEUE.md` (`templates/fixloop-prompt.md`) |
 | **Learn-loop** | on demand | interactive session with a human | execute the queue: plan → approve → fix → verify → close statuses (`skills/learn-loop/SKILL.md`) |
@@ -25,7 +25,7 @@ The split matters: the daily pass has no shell, so it can never push code or tou
 2. **Every entry carries a Status, and closing statuses is a required step, not a courtesy.** Unclosed entries are how a 150-entry backlog accumulates. When a fix ships, the entry gets a Resolution line with the commit/PR; when a rule is promoted, the entry says where.
 3. **Dead-man checks are alert-only.** A freshness monitor that also "repairs" things becomes a second actor racing the first. Alert; let a human or the interactive loop decide.
 4. **Stale-lock protocol.** A 0-byte `.git/index.lock` under a *running* git process is normal mid-operation state — removing it corrupts live work. Check for a live process first; only remove orphaned locks.
-5. **One file per entry, filename = ID.** Aggregate append-files written by concurrent sessions on multiple machines produce sync conflicts and lost edits. Per-entry files also make `Status` greps see the whole store.
+5. **One file per entry, filename = machine + ID.** Aggregate append-files written by concurrent sessions on multiple machines produce sync conflicts and lost edits. Each machine owns `entries/<machine>/<machine>--<ID>.md`; a leader catalogs copies by logical ID. Same-content copies deduplicate, while divergent copies remain intact and are flagged in `conflicts.json`.
 6. **Verification is a named observation, not a green exit.** Exit 0, a passing `doctor`, and an installed binary are not evidence. A row count equal to the page size is a failure signal. "Unverified" is always a legal outcome; a confident wrong number is not.
 7. **Liveness signals live outside protected paths.** On macOS, launchd's `/bin/bash` may be unable to write TCC-protected or cloud-synced directories even while the agent process it spawns can — so a run can succeed while its dead-man log line fails silently, the exact blindness the line exists to prevent. Write the RUN log to a plainly writable location (`~/Library/Logs`); a copy inside the store is a mirror, never the signal.
 8. **The loop eats its own dog food.** The miner must filter the loop's own injected prompts and notifications out of correction detection, or the system flags itself as user friction.
@@ -34,5 +34,36 @@ The split matters: the daily pass has no shell, so it can never push code or tou
 
 - `skills/learn-loop/SKILL.md` — the interactive execution skill (Claude Code skill format; adapt the trigger phrases to your setup).
 - `templates/fixloop-prompt.md` — the daily headless triage prompt.
-- `templates/learnings-fixloop-run.sh` — runner shim: invokes the headless pass, logs a RUN line unconditionally, makes a scoped commit with the stale-lock protocol.
+- `templates/learnings-fixloop-run.sh` — leader-only runner: catalogs evidence, invokes the headless pass, records decisions, and logs a RUN line unconditionally.
+- `templates/learnings-harvest-run.sh` — machine-local capture runner with external liveness logging.
+- `scripts/collect_learnings_fleet.sh` — leader collector for machine-owned entries and catalog publication.
 - `examples/com.example.learnings-fixloop.plist` — macOS LaunchAgent for the daily schedule.
+
+## Machine-local fleet store
+
+Do not use a cloud-synced directory as the live multi-writer database. Each Mac
+keeps its canonical evidence under `~/.agents/learnings/`:
+
+```text
+~/.agents/learnings/
+  config.json
+  entries/<machine>/<machine>--<ID>.md
+  legacy/<machine>/...
+  decisions/<ID>.json
+  queue/FIX-QUEUE.md
+  catalog.json
+  conflicts.json
+  ACTIVE.md
+```
+
+`bin/learnings-store migrate` copies a legacy store without deleting it, keeps a
+machine-namespaced snapshot, and extracts individual entries from legacy aggregate
+files. `scripts/collect_learnings_fleet.sh` runs on one leader, copies only the
+machine-owned entry directories, rebuilds the catalog, and publishes the generated
+catalog back to reachable peers. Evidence remains immutable; triage outcomes are
+separate decisions, so collection cannot overwrite them.
+
+Use `scripts/install_learnings_launchd.py` on Macs with a logged-in GUI session.
+For an always-headless leader with no `gui/<uid>` launchd domain, use
+`scripts/install_learnings_cron.py`; it owns only the marked learnings block and
+preserves unrelated crontab entries.

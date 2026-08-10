@@ -179,6 +179,50 @@ Fix workflows can import a batch handoff with `--resolve-from decisions.json`. T
 
 `target` and `decision` are required. `resolved_at` defaults to import time; `pr`, `note`, `by`, and `proposal_id` provide the review trail. Leave deferred or still-open proposals out of the file.
 
+## Machine-local learnings store
+
+For the capture/fixloop half of the system, keep the live evidence store out of
+Dropbox and other cloud-synced multi-writer directories. Initialize one local store
+per machine:
+
+```sh
+./bin/learnings-store --root ~/.agents/learnings init --machine silverfox
+```
+
+Migrate an existing store non-destructively:
+
+```sh
+./bin/learnings-store --root ~/.agents/learnings migrate \
+  --machine silverfox \
+  --source ~/Library/CloudStorage/Dropbox/OpenClaw/.learnings
+```
+
+Every entry is machine-owned and collision-resistant:
+
+```text
+~/.agents/learnings/entries/silverfox/silverfox--ERR-20260810-A7K2.md
+```
+
+A leader collects the other machine directories and materializes `catalog.json`,
+`conflicts.json`, and `ACTIVE.md`. Identical copies of a logical ID deduplicate in
+the catalog. Different content under the same logical ID is preserved per machine
+and reported as a conflict; no source file wins silently.
+
+```sh
+./scripts/collect_learnings_fleet.sh
+./bin/learnings-store --root ~/.agents/learnings validate
+```
+
+On any machine, show the leader-published list of items that still need attention:
+
+```sh
+learnings status
+```
+
+The legacy source remains untouched. Remove it only after every machine has run
+live capture, collection, and leader triage successfully for an agreed retention
+period.
+
 For `content_idea`, personal/private sessions are allowed as local source material, but the public output is intentionally conservative: high-risk content evidence suppresses command and excerpt text even when `--full` is enabled. Use the idea as a starting point, then remove names, raw messages, customer/client details, family details, auth material, exact private metrics, and any other identifying specifics before drafting or publishing.
 
 ### From staged proposals to executed fixes
