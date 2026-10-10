@@ -282,6 +282,14 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
 # (system instructions, task seeds, notifications), not something the user
 # typed. This generic rule future-proofs the explicit marker list below.
 LEADING_TAG_RE = re.compile(r"^<[A-Za-z][A-Za-z0-9_-]*[\s>/]")
+# The same scaffolding can also be appended after the user's typed text. Only
+# closed blocks with snake/kebab-case tag names (<app-context>,
+# <skills_instructions>) are stripped, so ordinary HTML a user pastes stays.
+EMBEDDED_SCAFFOLD_BLOCK_RE = re.compile(
+    r"<([A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL,
+)
+URL_RE = re.compile(r"\b(?:https?|file)://\S+", re.IGNORECASE)
 # Extra scaffold markers loaded from the config file ("extra_scaffold_markers").
 EXTRA_SCAFFOLD_MARKERS: List[str] = []
 # Shell command literals inside current Codex runtime code. Restricting to
@@ -640,17 +648,59 @@ def looks_like_pasted_transcript(text: str) -> bool:
     return len(TRANSCRIPT_TIMESTAMP_RE.findall(text)) >= 2
 
 
+def normalize_user_text(text: str) -> str:
+    """Whitespace-insensitive key for spotting a user message seen earlier.
+
+    Codex rollouts write each user message twice (response_item and event_msg)
+    and the copies can differ by trailing whitespace; an exact-match dedupe
+    lets the second copy count as a fresh correction.
+    """
+    return " ".join((text or "").split())
+
+
+def correction_scan_text(text: str) -> str:
+    """Blank out the parts of a user message that are not the user's own words.
+
+    Runtime context blocks appended after the typed text (``<app-context>``)
+    and URLs (whose paths can contain "instead" or "do-not") would otherwise
+    supply the correction cue. Matches become same-length whitespace so a cue
+    keeps its offset and stays inside the evidence excerpt.
+    """
+
+    def blank(match: re.Match[str]) -> str:
+        return " " * len(match.group(0))
+
+    text = EMBEDDED_SCAFFOLD_BLOCK_RE.sub(blank, text or "")
+    return URL_RE.sub(blank, text)
+
+
+def looks_like_json_payload(text: str) -> bool:
+    """True when the whole message is a pasted JSON object or array."""
+    if not text or text[0] not in "{[":
+        return False
+    try:
+        return isinstance(json.loads(text), (dict, list))
+    except ValueError:
+        return False
+
+
 def is_user_correction_text(text: str, path: Optional[Path] = None) -> bool:
     if not text or is_transcript_scaffold(text, path) or looks_like_pasted_transcript(text):
         return False
-    stripped = text.strip()
+    masked = correction_scan_text(text.strip())
+    # Stripping drops a trailing context block from the length caps, so it
+    # cannot push a short correction past the weak-cue limit.
+    own_words = masked.strip()
+    if looks_like_json_payload(own_words):
+        return False
+    size = len(own_words)
     # A proposal must show the phrase that triggered it. Searching beyond the
     # normal evidence excerpt turns appended runtime instructions into
     # invisible false positives that a reviewer cannot validate.
-    window = stripped[:CORRECTION_SCAN_LIMIT]
-    if len(stripped) <= STRONG_CORRECTION_MAX_CHARS and STRONG_CORRECTION_RE.search(window):
+    window = masked[:CORRECTION_SCAN_LIMIT]
+    if size <= STRONG_CORRECTION_MAX_CHARS and STRONG_CORRECTION_RE.search(window):
         return True
-    return len(stripped) <= WEAK_CORRECTION_MAX_CHARS and bool(WEAK_CORRECTION_RE.search(window))
+    return size <= WEAK_CORRECTION_MAX_CHARS and bool(WEAK_CORRECTION_RE.search(window))
 
 
 def add_tracked_cli_evidence(summary: SessionSummary, cli: str, ev: Evidence) -> None:
@@ -1130,7 +1180,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                 if (
                     agent_has_responded
                     and seen_user_texts
-                    and text not in seen_user_texts
+                    and normalize_user_text(text) not in seen_user_texts
                     and is_user_correction_text(text, path)
                 ):
                     summary.corrections.append(
@@ -1145,7 +1195,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         )
                     )
                 if not is_transcript_scaffold(text, path):
-                    seen_user_texts.add(text)
+                    seen_user_texts.add(normalize_user_text(text))
 
         if isinstance(content, list):
             for item in content:
@@ -1347,7 +1397,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
             if (
                 agent_has_responded
                 and seen_user_texts
-                and text not in seen_user_texts
+                and normalize_user_text(text) not in seen_user_texts
                 and is_user_correction_text(text, path)
             ):
                 summary.corrections.append(
@@ -1362,7 +1412,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     )
                 )
             if not is_transcript_scaffold(text, path):
-                seen_user_texts.add(text)
+                seen_user_texts.add(normalize_user_text(text))
 
         payload_type = payload.get("type")
         if payload_type == "agent_message" or (
@@ -1498,7 +1548,7 @@ def parse_hermes_messages(
             if (
                 agent_has_responded
                 and seen_user_texts
-                and content not in seen_user_texts
+                and normalize_user_text(content) not in seen_user_texts
                 and is_user_correction_text(content, path)
             ):
                 summary.corrections.append(
@@ -1513,7 +1563,7 @@ def parse_hermes_messages(
                     )
                 )
             if not is_transcript_scaffold(content, path):
-                seen_user_texts.add(content)
+                seen_user_texts.add(normalize_user_text(content))
 
         if tool_calls_raw:
             try:

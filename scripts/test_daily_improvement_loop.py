@@ -1271,6 +1271,83 @@ class CorrectionDetectionTests(unittest.TestCase):
             summary = loop.parse_claude_session(path)
             self.assertEqual(summary.corrections, [])
 
+    def test_codex_rollout_scaffolding_duplicates_and_acks_are_not_corrections(self):
+        # Shapes from issue #13: scaffold blocks sent as user-role messages,
+        # every user message written twice (response_item + event_msg), and
+        # non-corrective replies (acks, JSON payloads, bare URLs).
+        def user_item(text):
+            return {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+
+        def user_event(text):
+            return {"type": "event_msg", "payload": {"type": "user_message", "message": text}}
+
+        assistant = {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Working on it."}],
+            },
+        }
+        correction = "Actually, use the staging bucket."
+        rows = [
+            {"type": "session_meta", "payload": {"id": "rollout-13", "cwd": "/tmp/project"}},
+            user_item("<app-context>\nThe user is in the desktop app. Do not use emojis.\n</app-context>"),
+            user_item("<multi_agent_mode>\nDo not spawn agents instead of answering.\n</multi_agent_mode>"),
+            user_item("<skills_instructions>\nUse a skill instead of guessing.\n</skills_instructions>"),
+            user_item("Build the dashboard."),
+            user_event("Build the dashboard."),
+            assistant,
+            user_item(correction),
+            user_event(correction + "\n"),
+            assistant,
+            user_item("<app-context>\nWindow focus changed. Do not interrupt.\n</app-context>"),
+            user_item(
+                "Looks good, ship it.\n\n<app-context>\nThe user is in the desktop app. "
+                "Do not use emojis.\n</app-context>"
+            ),
+            user_item("ok"),
+            user_item("approved"),
+            user_item('{"status": "ok", "note": "use v2 instead"}'),
+            user_item("https://example.com/docs/do-not-track/instead"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "rollout-2026-08-02T10-10-53-test.jsonl"
+            write_jsonl(path, rows)
+            summary = loop.parse_codex_session(path)
+
+        self.assertEqual([c.excerpt for c in summary.corrections], [correction])
+
+    def test_non_corrective_payloads_are_not_corrections(self):
+        for text in (
+            "ok",
+            "done",
+            "approved",
+            "great",
+            '{"status": "ok", "note": "use v2 instead"}',
+            '[{"step": 1, "rule": "do not retry"}]',
+            "https://example.com/docs/do-not-track/instead",
+            "Looks good.\n<app-context>\nDo not use emojis.\n</app-context>",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(loop.is_user_correction_text(text))
+        # A real correction survives a URL or appended scaffold block.
+        self.assertTrue(
+            loop.is_user_correction_text("Actually, use https://example.com/v2 for this.")
+        )
+        self.assertTrue(
+            loop.is_user_correction_text(
+                "Actually, use the staging bucket.\n<app-context>\nDesktop app.\n</app-context>"
+            )
+        )
+
     def test_long_instruction_with_weak_cue_is_not_correction(self):
         long_brief = ("Please refactor the reporting module carefully. " * 12) + (
             "Do not change the public API."
