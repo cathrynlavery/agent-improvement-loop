@@ -9,6 +9,7 @@ memory, runbooks, source code.
 from __future__ import annotations
 
 import argparse
+import bisect
 import copy
 import datetime as dt
 import hashlib
@@ -285,10 +286,9 @@ LEADING_TAG_RE = re.compile(r"^<[A-Za-z][A-Za-z0-9_-]*[\s>/]")
 # The same scaffolding can also be appended after the user's typed text. Only
 # closed blocks with snake/kebab-case tag names (<app-context>,
 # <skills_instructions>) are stripped, so ordinary HTML a user pastes stays.
-EMBEDDED_SCAFFOLD_BLOCK_RE = re.compile(
-    r"<([A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+)\b[^>]*>.*?</\1\s*>",
-    re.DOTALL,
-)
+SCAFFOLD_TAG_NAME = r"[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+"
+SCAFFOLD_OPEN_TAG_RE = re.compile(rf"<({SCAFFOLD_TAG_NAME})\b[^<>]*>")
+SCAFFOLD_CLOSE_TAG_RE = re.compile(rf"</({SCAFFOLD_TAG_NAME})\s*>")
 URL_RE = re.compile(r"\b(?:https?|file)://\S+", re.IGNORECASE)
 # Extra scaffold markers loaded from the config file ("extra_scaffold_markers").
 EXTRA_SCAFFOLD_MARKERS: List[str] = []
@@ -667,11 +667,27 @@ def correction_scan_text(text: str) -> str:
     keeps its offset and stays inside the evidence excerpt.
     """
 
-    def blank(match: re.Match[str]) -> str:
-        return " " * len(match.group(0))
-
-    text = EMBEDDED_SCAFFOLD_BLOCK_RE.sub(blank, text or "")
-    return URL_RE.sub(blank, text)
+    text = text or ""
+    # Pair each opening tag with the next closing tag of the same name via a
+    # sorted index, so unclosed tags in pasted text cannot make this quadratic.
+    closes: Dict[str, List[int]] = {}
+    for match in SCAFFOLD_CLOSE_TAG_RE.finditer(text):
+        closes.setdefault(match.group(1), []).append(match.start())
+    chars = list(text)
+    covered_to = 0
+    for match in SCAFFOLD_OPEN_TAG_RE.finditer(text):
+        starts = closes.get(match.group(1))
+        if match.start() < covered_to or not starts:
+            continue
+        i = bisect.bisect_left(starts, match.end())
+        if i == len(starts):
+            continue
+        close = SCAFFOLD_CLOSE_TAG_RE.match(text, starts[i])
+        covered_to = close.end() if close else starts[i]
+        chars[match.start() : covered_to] = " " * (covered_to - match.start())
+    for match in URL_RE.finditer(text):
+        chars[match.start() : match.end()] = " " * (match.end() - match.start())
+    return "".join(chars)
 
 
 def looks_like_json_payload(text: str) -> bool:
@@ -686,6 +702,10 @@ def looks_like_json_payload(text: str) -> bool:
 
 def is_user_correction_text(text: str, path: Optional[Path] = None) -> bool:
     if not text or is_transcript_scaffold(text, path) or looks_like_pasted_transcript(text):
+        return False
+    # Check for JSON before masking: blanking a URL value also eats the
+    # closing quote and brace, and the payload would stop parsing.
+    if looks_like_json_payload(text.strip()):
         return False
     masked = correction_scan_text(text.strip())
     # Stripping drops a trailing context block from the length caps, so it

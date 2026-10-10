@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -1333,6 +1334,7 @@ class CorrectionDetectionTests(unittest.TestCase):
             "great",
             '{"status": "ok", "note": "use v2 instead"}',
             '[{"step": 1, "rule": "do not retry"}]',
+            '{"note": "do not retry", "url": "https://example.com"}',
             "https://example.com/docs/do-not-track/instead",
             "Looks good.\n<app-context>\nDo not use emojis.\n</app-context>",
         ):
@@ -1347,6 +1349,17 @@ class CorrectionDetectionTests(unittest.TestCase):
                 "Actually, use the staging bucket.\n<app-context>\nDesktop app.\n</app-context>"
             )
         )
+
+    def test_unclosed_scaffold_tags_are_scanned_in_linear_time(self):
+        # Each unclosed opening tag used to rescan the rest of the message for
+        # its closing tag, so pasted fragments made scans quadratic.
+        text = "x " + "<app-context> filler " * 50000
+        started = time.monotonic()
+        masked = loop.correction_scan_text(text)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(masked, text)
+        nested = "keep <app-context>a <app-context>b</app-context> c</app-context> tail"
+        self.assertEqual(loop.correction_scan_text(nested).split(), ["keep", "c</app-context>", "tail"])
 
     def test_long_instruction_with_weak_cue_is_not_correction(self):
         long_brief = ("Please refactor the reporting module carefully. " * 12) + (
