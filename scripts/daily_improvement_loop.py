@@ -79,6 +79,10 @@ WEAK_CORRECTION_RE = re.compile(
 )
 STRONG_CORRECTION_MAX_CHARS = 2000
 WEAK_CORRECTION_MAX_CHARS = 400
+CLAUDE_USAGE_RESET_MESSAGE = (
+    "Your claude.ai usage limit has reset. Continue the task you were working on "
+    "when the limit was reached; do not repeat work that is already complete."
+)
 # Cap correction evidence carried per session so one noisy session cannot
 # dominate a memory/context proposal.
 MAX_CORRECTIONS_PER_SESSION = 3
@@ -96,6 +100,13 @@ FAILURE_RE = re.compile(
     r"\b(error|failed|failure|invalid|unauthorized|forbidden)\b"
     r")",
     re.IGNORECASE,
+)
+MCP_CONTROL_RESULT_RE = re.compile(
+    r"(?is)(?:"
+    r"permission for this action was denied by .* classifier|"
+    r"the user (?:doesn't|does not) want to proceed with this tool use|"
+    r"the tool use was rejected"
+    r")"
 )
 BAD_EXIT_RE = re.compile(r"(?i)(process exited with code|exit code)[:\s]+[1-9]\d*\b")
 GOOD_EXIT_RE = re.compile(r"(?i)(process exited with code|exit code)[:\s]+0\b")
@@ -703,6 +714,8 @@ def looks_like_json_payload(text: str) -> bool:
 def is_user_correction_text(text: str, path: Optional[Path] = None) -> bool:
     if not text or is_transcript_scaffold(text, path) or looks_like_pasted_transcript(text):
         return False
+    if text.strip() == CLAUDE_USAGE_RESET_MESSAGE:
+        return False
     # Check for JSON before masking: blanking a URL value also eats the
     # closing quote and brace, and the payload would stop parsing.
     if looks_like_json_payload(text.strip()):
@@ -965,6 +978,8 @@ def tool_result_is_failure(
     call: Optional[ToolCall], text: str, is_error: Optional[bool] = None
 ) -> bool:
     """Classify a result while requiring status for tracked CLI/MCP calls."""
+    if call and call.name.startswith("mcp__") and MCP_CONTROL_RESULT_RE.search(text):
+        return False
     if isinstance(is_error, bool):
         return is_error
     if not text:

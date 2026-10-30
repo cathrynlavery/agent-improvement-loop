@@ -1337,6 +1337,7 @@ class CorrectionDetectionTests(unittest.TestCase):
             '{"note": "do not retry", "url": "https://example.com"}',
             "https://example.com/docs/do-not-track/instead",
             "Looks good.\n<app-context>\nDo not use emojis.\n</app-context>",
+            loop.CLAUDE_USAGE_RESET_MESSAGE,
         ):
             with self.subTest(text=text):
                 self.assertFalse(loop.is_user_correction_text(text))
@@ -1921,6 +1922,16 @@ class McpFailureTests(unittest.TestCase):
             p for p in loop.generate_proposals([s1]) if p["target"]["kind"] == "mcp_server"
         ]
         self.assertEqual(proposals, [])
+
+    def test_mcp_control_results_are_not_failures(self):
+        call = loop.ToolCall(call_id="mcp", name="mcp__service__update", line=1)
+        for result in (
+            "Permission for this action was denied by the Claude Code auto mode classifier.",
+            "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+        ):
+            with self.subTest(result=result):
+                self.assertFalse(loop.tool_result_is_failure(call, result, is_error=True))
+        self.assertTrue(loop.tool_result_is_failure(call, "Not authenticated (401)", True))
 
     def test_recurring_mcp_silent_empty_routes_to_server(self):
         with tempfile.TemporaryDirectory() as td:
